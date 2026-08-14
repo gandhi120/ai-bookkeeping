@@ -24,7 +24,7 @@ export async function createTransaction(transaction) {
       notes,
       telegram_message_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    VALUES ($1, $2, $3, $4, $5, $6, $7::date , $8, $9)
     RETURNING *;
     `,
     [

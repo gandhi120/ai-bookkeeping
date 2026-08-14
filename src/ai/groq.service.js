@@ -36,7 +36,9 @@ Rules:
 - If quantity is not mentioned, use 1.
 - If person is not mentioned, use null.
 - If notes are not mentioned, use null.
-- Use today's date if the user does not provide a date.
+- If the user does not provide a date, use this date: ${new Date().toLocaleDateString("en-CA", {
+  timeZone: "Asia/Kolkata",
+})}.
 - Return ONLY JSON.
         `,
       },
@@ -48,5 +50,13 @@ Rules:
     temperature: 0,
   });
 
-  return response.choices[0].message.content;
+// Get the text returned by Groq
+const rawResponse = response.choices[0].message.content;
+// Remove Markdown code fences if Groq adds them
+const cleanedResponse = rawResponse
+  .replace(/```json/g, "")
+  .replace(/```/g, "")
+  .trim();
+
+return cleanedResponse;
 }
