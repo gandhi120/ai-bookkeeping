@@ -1,0 +1,32 @@
+{
+  "name": "ai-bookkeeping",
+  "version": "1.0.0",
+  "description": "AI-powered bookkeeping assistant using Telegram, Node.js, Groq, PostgreSQL, and Google Sheets",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gandhi120/ai-bookkeeping.git"
+  },
+  "keywords": [
+    "ai",
+    "bookkeeping",
+    "telegram",
+    "nodejs",
+    "postgresql",
+    "groq"
+  ],
+  "author": "Varun Gandhi",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/gandhi120/ai-bookkeeping/issues"
+  },
+  "homepage": "https://github.com/gandhi120/ai-bookkeeping#readme",
+  "dependencies": {
+    "fastify": "^5.12.0"
+  }
+}
