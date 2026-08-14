@@ -20,10 +20,20 @@ export async function processTransaction(messageText, telegramMessageId) {
     telegram_message_id: telegramMessageId,
   };
 
-  // 5. Save the validated transaction to PostgreSQL.
-  const savedTransaction = await createTransaction(
-    transactionWithTelegramId
-  );
+const savedTransaction = await createTransaction(
+  transactionWithTelegramId
+);
 
-  return savedTransaction;
+// If PostgreSQL returned nothing,
+// this Telegram message was already processed.
+if (!savedTransaction) {
+  return {
+    duplicate: true,
+  };
+}
+
+return {
+  duplicate: false,
+  transaction: savedTransaction,
+};
 }
