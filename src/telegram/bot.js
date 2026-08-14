@@ -1,8 +1,6 @@
 import TelegramBot from "node-telegram-bot-api";
 import "dotenv/config";
-import { askGroq } from "../ai/groq.service.js";
-import { TransactionSchema } from "../schemas/transaction.schema.js";
-import { createTransaction } from "../database/postgres.js";
+import { processTransaction } from "../services/transaction.service.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -15,31 +13,38 @@ const bot = new TelegramBot(token, {
 
 console.log("Telegram bot is running...");
 
-// This function runs whenever someone sends a message to our bot.
+// Runs whenever someone sends a message to the bot.
 bot.on("message", async (message) => {
-  console.log("Message received:", message.text);
+  try {
+    console.log("Message received:", message.text);
 
-  const aiResponse = await askGroq(message.text);
-  const transaction = JSON.parse(aiResponse);
+    // Send the message to our transaction service.
+    // The service handles:
+    // Telegram message → Groq → JSON → Zod → PostgreSQL
+    const savedTransaction = await processTransaction(
+      message.text,
+      message.message_id
+    );
 
-  console.log("Parsed transaction:", transaction);
+    console.log("Saved transaction:", savedTransaction);
 
-  const validatedTransaction = TransactionSchema.parse(transaction);
+    // Send confirmation back to the user.
+    await bot.sendMessage(
+      message.chat.id,
+      `Transaction saved successfully.\n\nAmount: ₹${savedTransaction.amount}`
+    );
+  } catch (error) {
+    console.error("Transaction processing error:", error);
 
-console.log("Validated transaction:", validatedTransaction);
-const savedTransaction = await createTransaction({
-  ...validatedTransaction,
-  telegram_message_id: message.message_id,
+    // Tell the user if something went wrong.
+    await bot.sendMessage(
+      message.chat.id,
+      "Sorry, I couldn't process that transaction."
+    );
+  }
 });
 
-console.log("Saved transaction:", savedTransaction);
-
-  await bot.sendMessage(
-    message.chat.id,
-    aiResponse
-  );
-});
-
+// Handles Telegram polling errors.
 bot.on("polling_error", (error) => {
   console.error("Telegram polling error:", error.message);
 });
