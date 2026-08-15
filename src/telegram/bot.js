@@ -7,6 +7,8 @@ import {
   getTransactionsByDate,
   createTransaction,
   findOrCreateUser,
+  createMessage,
+  updateMessageStatus,
 } from "../database/postgres.js";
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -228,11 +230,26 @@ bot.on("message", async (message) => {
 
   console.log("User:", user);
 
+  // Save every incoming Telegram message.
+  const savedMessage = await createMessage({
+    user_id: user.id,
+    telegram_message_id: message.message_id,
+    message_text: message.text,
+    status: "RECEIVED",
+  });
+
+  console.log("Message saved:", savedMessage);
+
+  // Mark the message as currently being processed by AI.
+  await updateMessageStatus(
+    savedMessage.id,
+    "PROCESSING"
+  );
+
   try {
     console.log("Message received:", message.text);
 
-    // Telegram → Groq → JSON → Zod
-    // PostgreSQL is NOT called here.
+    // Process the message using Groq and validate the result with Zod.
     const result = await processTransaction(
       message.text,
       message.message_id
@@ -243,12 +260,20 @@ bot.on("message", async (message) => {
       result
     );
 
-    // Store the transaction until the user confirms it.
+    // AI processing succeeded, so wait for user confirmation.
+    await updateMessageStatus(
+      savedMessage.id,
+      "PENDING_CONFIRMATION"
+    );
+
+    // Store the transaction and database message ID
+    // until the user confirms or cancels it.
     pendingTransactions.set(
       message.message_id,
       {
         ...result.transaction,
         user_id: user.id,
+        message_id: savedMessage.id,
       }
     );
 
@@ -293,6 +318,12 @@ Date: ${new Date(
       error
     );
 
+    // Mark the message as failed because AI processing failed.
+    await updateMessageStatus(
+      savedMessage.id,
+      "FAILED"
+    );
+
     await bot.sendMessage(
       message.chat.id,
       "Sorry, I couldn't process that transaction."
@@ -328,21 +359,26 @@ bot.on("callback_query", async (query) => {
     // ----------------------------------------------
 
     if (action === "cancel") {
-      pendingTransactions.delete(telegramMessageId);
+       // Mark the original Telegram message as cancelled.
+        await updateMessageStatus(
+          transaction.message_id,
+          "CANCELLED"
+        );
+          pendingTransactions.delete(telegramMessageId);
 
-      await bot.answerCallbackQuery(query.id, {
-        text: "Transaction cancelled.",
-      });
+          await bot.answerCallbackQuery(query.id, {
+            text: "Transaction cancelled.",
+          });
 
-      await bot.editMessageText(
-        "❌ Transaction cancelled.",
-        {
-          chat_id: query.message.chat.id,
-          message_id: query.message.message_id,
-        }
-      );
+          await bot.editMessageText(
+            "❌ Transaction cancelled.",
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id,
+            }
+          );
 
-      return;
+          return;
     }
 
     // ----------------------------------------------
@@ -352,24 +388,30 @@ bot.on("callback_query", async (query) => {
     if (action === "confirm") {
       const savedTransaction =
         await createTransaction(transaction);
+      
+        // Mark the original Telegram message as confirmed.
+        await updateMessageStatus(
+          transaction.message_id,
+          "CONFIRMED"
+        );
 
-      pendingTransactions.delete(telegramMessageId);
+          pendingTransactions.delete(telegramMessageId);
 
-      await bot.answerCallbackQuery(query.id, {
-        text: "Transaction saved!",
-      });
+          await bot.answerCallbackQuery(query.id, {
+            text: "Transaction saved!",
+          });
 
-      await bot.editMessageText(
-        `✅ Transaction saved
+          await bot.editMessageText(
+            `✅ Transaction saved
 
-Type: ${savedTransaction.transaction_type}
-Description: ${savedTransaction.description}
-Amount: ₹${savedTransaction.amount}`,
-        {
-          chat_id: query.message.chat.id,
-          message_id: query.message.message_id,
-        }
-      );
+                Type: ${savedTransaction.transaction_type}
+                Description: ${savedTransaction.description}
+                Amount: ₹${savedTransaction.amount}`,
+                {
+                  chat_id: query.message.chat.id,
+                  message_id: query.message.message_id,
+                }
+          );
     }
   } catch (error) {
     console.error(

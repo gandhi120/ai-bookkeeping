@@ -108,3 +108,46 @@ export async function getTransactionsByMonth(year, month) {
 
   return result.rows;
 }
+
+// Saves every incoming Telegram message.
+export async function createMessage(message) {
+  const result = await pool.query(
+    `
+    INSERT INTO messages (
+      user_id,
+      telegram_message_id,
+      message_text,
+      status
+    )
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (user_id, telegram_message_id)
+    DO NOTHING
+    RETURNING *;
+    `,
+    [
+      message.user_id,
+      message.telegram_message_id,
+      message.message_text,
+      message.status,
+    ]
+  );
+
+  return result.rows[0];
+}
+
+// Updates the processing status of a Telegram message.
+export async function updateMessageStatus(messageId, status) {
+  const result = await pool.query(
+    `
+    UPDATE messages
+    SET
+      status = $1,
+      updated_at = NOW()
+    WHERE id = $2
+    RETURNING *;
+    `,
+    [status, messageId]
+  );
+
+  return result.rows[0];
+}
