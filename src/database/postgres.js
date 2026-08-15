@@ -310,9 +310,15 @@ export async function getAllOutstanding(userId) {
 
 // Confirms a pending message and creates its transaction atomically.
 // Both database changes succeed together or both are rolled back.
+//
+// typeOverride is used when the AI could not tell what a payment meant and
+// the shopkeeper answered the clarification question. Passing their answer
+// in here (instead of updating transaction_data first and confirming after)
+// keeps it a single atomic step, so a double tap still produces one row.
 export async function confirmMessageTransaction(
   messageId,
-  userId
+  userId,
+  typeOverride = null
 ) {
   const client = await pool.connect();
 
@@ -370,6 +376,12 @@ export async function confirmMessageTransaction(
       };
     }
 
+    // The shopkeeper's clarification wins over what the AI stored. Resolved
+    // here, inside the transaction, so the type, the customer link and the
+    // row are all decided together or not at all.
+    const transactionType =
+      typeOverride ?? message.transaction_data.transaction_type;
+
     // For udhaar transactions (credit_sale / repayment), resolve the
     // customer BEFORE inserting, using the same client so the customer
     // creation is part of this same atomic transaction. Normal purchases,
@@ -377,7 +389,7 @@ export async function confirmMessageTransaction(
     let customerId = null;
 
     if (
-      isCustomerTransaction(message.transaction_data.transaction_type) &&
+      isCustomerTransaction(transactionType) &&
       message.transaction_data.person
     ) {
       const customer = await findOrCreateCustomer(
@@ -425,7 +437,7 @@ export async function confirmMessageTransaction(
       `,
       [
         userId,
-        message.transaction_data.transaction_type,
+        transactionType,
         message.transaction_data.description,
         message.transaction_data.category,
         message.transaction_data.quantity,

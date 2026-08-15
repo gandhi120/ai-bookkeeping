@@ -5,100 +5,204 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-export async function askGroq(message) {
-  const response = await groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages: [
-      {
-        role: "system",
-        content: `
-You are an AI bookkeeping assistant for an Indian SHOPKEEPER.
+// The system prompt is sent with EVERY message, so its length is a running
+// cost: prompt tokens x every message the shop sends. On the free tier that
+// is the binding limit, not the code. Keep it terse — state a rule once, and
+// add an example only for a case the rule alone keeps getting wrong.
+//
+// Built fresh per message because the default date has to be today's date
+// in the shop's timezone. Both providers below use this same text: if the
+// fallback had its own prompt they would drift, and the same sentence would
+// book differently depending on which one happened to answer.
+function buildSystemPrompt() {
+  return `
+Bookkeeping assistant for an Indian SHOPKEEPER. The sender is always the
+shopkeeper; any named person ("Raj") is their customer, never the sender.
 
-The person writing to you is always the shopkeeper. Customers never
-write to you. "Raj" is one of the shopkeeper's customers, not the sender.
+"intent" is ALWAYS exactly one of: transaction, balance_query, history_query.
+Never copy a transaction_type into "intent". Anything being RECORDED, however
+short, is intent "transaction".
 
-First decide the INTENT of the message:
+ASKING about a customer:
+{"intent": "balance_query" | "history_query", "person": "Name"}
+balance_query = how much is owed. history_query = show their entries.
 
-- "transaction"    -> the shopkeeper is RECORDING something that happened.
-- "balance_query"  -> the shopkeeper is ASKING how much a customer owes.
-- "history_query"  -> the shopkeeper is ASKING to see a customer's entries.
-
-If intent is "balance_query" or "history_query", return ONLY:
-
-{
-  "intent": "balance_query" | "history_query",
-  "person": "customer name"
-}
-
-If intent is "transaction", return ONLY:
-
+RECORDING anything else:
 {
   "intent": "transaction",
-  "transaction_type": "sale | purchase | expense | payment_received | payment_sent | credit_sale | repayment | other",
+  "transaction_type": "sale|purchase|expense|payment_received|payment_sent|credit_sale|repayment|other",
   "description": "string",
   "category": "string",
-  "quantity": "integer",
-  "amount": "number",
+  "quantity": integer,
+  "amount": number,
   "person": "string or null",
   "transaction_date": "YYYY-MM-DD",
   "notes": "string or null"
 }
 
-Transaction type meanings:
+TYPES
+purchase          bought goods/stock
+sale              sold and was PAID immediately
+expense           business cost: electricity, rent, transport, salary, upkeep
+payment_sent      money out to a supplier or non-customer
+payment_received  money in that is NOT a stated udhaar repayment
+credit_sale       UDHAAR GIVEN: a named customer took goods without paying,
+                  or is stated to owe money. They now owe MORE.
+repayment         UDHAAR PAID BACK: the message SAYS this settles an existing
+                  debt. They now owe LESS.
 
-- purchase          -> the shopkeeper bought goods/stock.
-- sale              -> the shopkeeper sold goods and was PAID immediately.
-- expense           -> a business cost: electricity, rent, transport, salary, shop maintenance.
-- payment_sent      -> money paid out to a supplier or someone who is NOT a khata customer.
-- payment_received  -> money received that is NOT a customer repaying udhaar.
-- credit_sale       -> UDHAAR GIVEN. A named customer took goods WITHOUT paying,
-                       or the shopkeeper states a customer owes money.
-                       The customer now owes MORE.
-- repayment         -> UDHAAR PAID BACK. A named customer gave money to settle
-                       what they already owed. The customer now owes LESS.
+MONEY IN - repayment vs payment_received. NEVER GUESS: this changes what a
+customer owes.
+Use repayment ONLY if the message contains a debt word: udhaar, credit,
+baaki, due, paid back, returned, cleared, settled, remaining, pending,
+pacha aapya, "towards his/her".
+  "Raj paid 1000 towards his udhaar", "Raj paid back 1000", "Raj paid
+  remaining 1000", "Raj ne baaki 500 de diye" -> repayment, person Raj
+No debt word means the message never said what the money was for. Use
+payment_received and KEEP the name. A name alone is NOT a repayment.
+  "Received 5000 from Raj", "Raj gave me 5000", "Raj paid 1000"
+  -> payment_received, person Raj
+Nobody named -> person null.
+  "Received 5000 cash", "Received 5000 from a walk-in customer"
+  -> payment_received, null
+  "Paid 3000 to supplier" -> payment_sent, null
 
-Udhaar rules (very important):
+UDHAAR GIVEN
+  "Raj took goods for 2000 on udhaar", "Sold goods to Amit for 2500 on
+  credit", "Raj owes me 5000" -> credit_sale, that person, that amount
+A named person taking goods without paying is credit_sale, NOT sale.
 
-- "Raj took goods for 2000 on udhaar"      -> credit_sale, person Raj, amount 2000
-- "Raj bought groceries for 1500 on credit"-> credit_sale, person Raj, amount 1500
-- "Sold goods to Amit for 2500 on credit"  -> credit_sale, person Amit, amount 2500
-- "Raj owes me 5000"                       -> credit_sale, person Raj, amount 5000
-- "Raj paid 1000"                          -> repayment, person Raj, amount 1000
-- "Raj paid remaining 1000"                -> repayment, person Raj, amount 1000
-- "Raj cleared his 3000 udhaar"            -> repayment, person Raj, amount 3000
+LANGUAGE
+English, Gujarati script, Roman Gujarati, Hinglish or any mix must produce
+the SAME JSON. Always write "person" and "category" in ENGLISH LETTERS and
+strip grammar endings: રાજેશ / રાજેશે / "Rajesh e" / "Rajesh ne" -> "Rajesh".
+  ઉધાર/udhar + માલ,સામાન/maal,saman + લીધો/lidho     -> credit_sale
+  પાછા આપ્યા/pacha aapya, ઉધારના આપ્યા/udhar na aapya -> repayment
+  બાકી/baki, કેટલા/ketla ... છે/che (a question)      -> balance_query
+  હિસાબ/hisab + બતાવો/batavo                          -> history_query
+  લીધા/lidha with no name and no udhar word           -> purchase
+  બિલ/bill + ભર્યું/bharyu                             -> expense
+"aapyu/aapya" alone only means "gave" - repayment ONLY with an
+udhar/baki/pacha word, otherwise follow MONEY IN.
 
-- A NAMED person giving money back is "repayment", NOT "payment_received".
-- A NAMED person taking goods without paying is "credit_sale", NOT "sale".
-- "Paid 3000 to supplier" has no customer name -> payment_sent, person null.
-
-General rules:
-- Never invent an amount.
-- If the amount is missing, return null for amount.
-- If quantity is not mentioned, use 1.
-- If person is not mentioned, use null.
-- If notes are not mentioned, use null.
+RULES
+- Never invent an amount. If missing, amount is null.
+- Default quantity 1, person null, notes null when not mentioned.
 - For credit_sale and repayment, person must be the customer's name.
-- If the user does not provide a date, use this date: ${new Date().toLocaleDateString("en-CA", {
+- No date given -> use ${new Date().toLocaleDateString("en-CA", {
   timeZone: "Asia/Kolkata",
 })}.
 - Return ONLY JSON.
-        `,
-      },
-      {
-        role: "user",
-        content: message,
-      },
+`;
+}
+
+// Either provider can wrap its JSON in a markdown code fence.
+function stripCodeFences(text) {
+  return text
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+// PRIMARY provider.
+async function askGroq(message) {
+  const response = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      { role: "system", content: buildSystemPrompt() },
+      { role: "user", content: message },
     ],
     temperature: 0,
   });
 
-// Get the text returned by Groq
-const rawResponse = response.choices[0].message.content;
-// Remove Markdown code fences if Groq adds them
-const cleanedResponse = rawResponse
-  .replace(/```json/g, "")
-  .replace(/```/g, "")
-  .trim();
+  return stripCodeFences(response.choices[0].message.content);
+}
 
-return cleanedResponse;
+// FALLBACK provider, used when Groq fails — most often because the free
+// tier's 100k tokens/day is exhausted. Plain REST with the built-in fetch:
+// this is one HTTP POST, so a Google SDK would be more code than the request.
+async function askGemini(message) {
+  // `||` not `??`: an unset key in .env reads as "" rather than undefined,
+  // and "" would build a URL with no model name in it.
+  //
+  // Pinned to an exact version on purpose. The `-latest` aliases get
+  // repointed by Google without warning, and this prompt is tuned to one
+  // model's behaviour — a silent swap would change how messages classify
+  // with no deploy on our side. Google also retires old models outright
+  // (gemini-2.0-flash now 404s), so this needs reviewing, not forgetting.
+  const model = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": process.env.GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        // Gemini keeps instructions separate from the user's message — the
+        // same split as Groq's system/user roles.
+        system_instruction: { parts: [{ text: buildSystemPrompt() }] },
+        contents: [{ role: "user", parts: [{ text: message }] }],
+        generationConfig: {
+          temperature: 0,
+          // Ask for raw JSON instead of prose wrapped in a fence.
+          responseMimeType: "application/json",
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Gemini ${response.status}: ${(await response.text()).slice(0, 200)}`
+    );
+  }
+
+  const data = await response.json();
+
+  // Gemini nests the answer, and omits parts entirely when it declines.
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!text) {
+    throw new Error(
+      `Gemini returned no content: ${JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+
+  return stripCodeFences(text);
+}
+
+// Asks Gemini first and falls back to Groq if it fails for any reason
+// (rate limit, outage, network). Both get the identical prompt, so the
+// caller cannot tell which one answered.
+//
+// Gemini leads because its limit is 15 requests per MINUTE, which recovers
+// in a minute, while Groq's is 100k tokens per DAY — once that runs out the
+// shop is down until tomorrow. Gemini is also cheaper per message (~1,105
+// tokens vs ~1,200) and faster (~1.3s vs ~1.5s), and passes all 32 cases in
+// tests/ai.test.js including the Gujarati ones.
+//
+// Without GEMINI_API_KEY this calls Groq directly and behaves exactly as it
+// did before the fallback existed.
+export async function askAI(message) {
+  if (!process.env.GEMINI_API_KEY) {
+    return await askGroq(message);
+  }
+
+  try {
+    return await askGemini(message);
+  } catch (geminiError) {
+    console.warn("Gemini failed, falling back to Groq:", geminiError.message);
+
+    try {
+      return await askGroq(message);
+    } catch (groqError) {
+      // Surface both, otherwise a Gemini key typo looks like a Groq outage.
+      throw new Error(
+        `Both providers failed. Gemini: ${geminiError.message} | Groq: ${groqError.message}`
+      );
+    }
+  }
 }

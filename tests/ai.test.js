@@ -18,7 +18,6 @@ const CASES = [
   { text: "Sold 5 shirts for ₹2500", intent: "transaction", type: "sale", amount: 2500, person: null },
   { text: "Paid electricity bill ₹1800", intent: "transaction", type: "expense", amount: 1800, person: null },
   { text: "Paid ₹3000 to supplier", intent: "transaction", type: "payment_sent", amount: 3000 },
-  { text: "Received ₹5000 from Raj", intent: "transaction", amount: 5000, person: "Raj" },
 
   // Udhaar given
   { text: "Raj took goods for ₹2000 on udhaar", intent: "transaction", type: "credit_sale", amount: 2000, person: "Raj" },
@@ -26,22 +25,64 @@ const CASES = [
   { text: "Sold goods to Amit for ₹2500 on credit", intent: "transaction", type: "credit_sale", amount: 2500, person: "Amit" },
   { text: "Raj owes me ₹5000", intent: "transaction", type: "credit_sale", amount: 5000, person: "Raj" },
 
-  // Udhaar repaid
-  { text: "Raj paid ₹1000", intent: "transaction", type: "repayment", amount: 1000, person: "Raj" },
+  // Udhaar repaid — only when the message SAYS it settles a debt.
+  { text: "Raj paid ₹1000 towards his udhaar", intent: "transaction", type: "repayment", amount: 1000, person: "Raj" },
+  { text: "Raj paid back ₹1000", intent: "transaction", type: "repayment", amount: 1000, person: "Raj" },
   { text: "Raj paid remaining ₹1000", intent: "transaction", type: "repayment", amount: 1000, person: "Raj" },
   { text: "Raj cleared his ₹3000 udhaar", intent: "transaction", type: "repayment", amount: 3000, person: "Raj" },
+  { text: "Raj ne baaki ₹500 de diye", intent: "transaction", type: "repayment", amount: 500, person: "Raj" },
+
+  // Ambiguous money in — the message never says what it was for, so it must
+  // NOT come back as a repayment. The bot asks the shopkeeper instead.
+  // These are the cases that used to silently reduce a customer's balance.
+  { text: "Received ₹5000 from Raj", intent: "transaction", type: "payment_received", amount: 5000, person: "Raj" },
+  { text: "Raj gave me ₹5000", intent: "transaction", type: "payment_received", amount: 5000, person: "Raj" },
+  { text: "Raj gave me ₹5000 for the order", intent: "transaction", type: "payment_received", amount: 5000, person: "Raj" },
+  { text: "Raj paid ₹1000", intent: "transaction", type: "payment_received", amount: 1000, person: "Raj" },
+
+  // Nobody named: ordinary income, no customer involved, nothing to ask.
+  { text: "Received ₹5000 cash", intent: "transaction", type: "payment_received", amount: 5000, person: null },
+  { text: "Received ₹5000 from a walk-in customer", intent: "transaction", type: "payment_received", amount: 5000, person: null },
 
   // Questions, not transactions
   { text: "How much does Raj owe me?", intent: "balance_query", person: "Raj" },
   { text: "Raj ka kitna baaki hai?", intent: "balance_query", person: "Raj" },
   { text: "Show Raj's transactions", intent: "history_query", person: "Raj" },
+
+  // Multi-language: the same meaning must produce the same record in English,
+  // Gujarati script, Roman Gujarati and mixed. `person` is always compared in
+  // English letters because customers are matched on lower(name) in SQL —
+  // "રાજેશ" and "Rajesh" must not open two separate khatas.
+  { text: "Raj took goods for ₹2000 on credit", intent: "transaction", type: "credit_sale", amount: 2000, person: "Raj" },
+  { text: "રાજેશે ₹2000 નો માલ ઉધાર લીધો", intent: "transaction", type: "credit_sale", amount: 2000, person: "Rajesh" },
+  { text: "Rajesh e 2000 no maal udhar lidho", intent: "transaction", type: "credit_sale", amount: 2000, person: "Rajesh" },
+  { text: "Rajesh e ₹2000 na kapda udhar lidha", intent: "transaction", type: "credit_sale", amount: 2000, person: "Rajesh" },
+  { text: "રાજેશે ₹1000 પાછા આપ્યા", intent: "transaction", type: "repayment", amount: 1000, person: "Rajesh" },
+  { text: "Rajesh e 1000 pacha aapya", intent: "transaction", type: "repayment", amount: 1000, person: "Rajesh" },
+  { text: "રાજેશના કેટલા રૂપિયા બાકી છે?", intent: "balance_query", person: "Rajesh" },
+  { text: "Rajesh na ketla rupiya baki che?", intent: "balance_query", person: "Rajesh" },
+  { text: "આજે લાઇટનું બિલ ₹1800 ભર્યું", intent: "transaction", type: "expense", amount: 1800, person: null },
+  { text: "Bought rice for ₹600", intent: "transaction", type: "purchase", amount: 600, person: null },
 ];
 
 let passed = 0;
 let failed = 0;
 
+// Gemini's free tier allows 15 requests per MINUTE per model, so firing the
+// whole suite at once gets most of it rejected with a 429 that looks like a
+// classification failure. 5s spacing = 12/min, comfortably under; 4.5s was
+// close enough to the ceiling to still lose a case now and then.
+// Override with TEST_DELAY_MS=0 when running against a paid tier.
+const DELAY_MS = Number(process.env.TEST_DELAY_MS ?? 5000);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 for (const [index, testCase] of CASES.entries()) {
   let result;
+
+  if (index > 0 && DELAY_MS > 0) {
+    await sleep(DELAY_MS);
+  }
 
   try {
     result = await processMessage(testCase.text, 900000 + index);

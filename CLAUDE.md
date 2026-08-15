@@ -20,13 +20,17 @@ There are no tests and no linter configured.
 
 Required env vars (in `.env`, loaded via `dotenv/config`): `GROQ_API_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`.
 
+Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-2.0-flash`.
+
 ## Architecture
 
 ES modules throughout (`"type": "module"`). Flow for an incoming message:
 
 1. **`src/telegram/bot.js`** — all Telegram handling: slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`), free-text message handler, and the confirm/cancel `callback_query` handler. This is the orchestrator.
 2. **`src/services/transaction.service.js`** — `processTransaction()`: asks Groq, `JSON.parse`s the reply, validates with `TransactionSchema` (Zod), attaches the Telegram message ID. Does not touch the database.
-3. **`src/ai/groq.service.js`** — the Groq call and the extraction prompt (transaction types, defaulting rules, date handling). Strips markdown fences from the response.
+3. **`src/ai/groq.service.js`** — exports `askAI()`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`llama-3.3-70b-versatile`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt()` — the single extraction prompt both providers share (transaction types, udhaar rules, language handling, date defaulting) — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
+
+   Model IDs are pinned deliberately — never use Gemini's `-latest` aliases, which Google repoints without warning, and note that Google *retires* models outright (`gemini-2.0-flash` now 404s).
 4. **`src/database/postgres.js`** — all SQL lives here (pg `Pool`, raw queries). No ORM, no migration files in the repo — the `users`, `messages`, and `transactions` tables are assumed to exist already.
 5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — aggregate totals in JS over rows fetched by date/month.
 

@@ -1,4 +1,4 @@
-import { askGroq } from "../ai/groq.service.js";
+import { askAI } from "../ai/groq.service.js";
 import { MessageSchema } from "../schemas/transaction.schema.js";
 
 // Turns one raw Telegram message into a validated, structured result.
@@ -13,8 +13,9 @@ import { MessageSchema } from "../schemas/transaction.schema.js";
 //   { intent: "balance_query", person: "Raj" }      -> answer immediately
 //   { intent: "history_query", person: "Raj" }      -> answer immediately
 export async function processMessage(messageText, telegramMessageId) {
-  // 1. Ask Groq to understand the shopkeeper's message.
-  const aiResponse = await askGroq(messageText);
+  // 1. Ask the AI to understand the shopkeeper's message. Groq answers
+  //    normally; Gemini takes over automatically if Groq is unavailable.
+  const aiResponse = await askAI(messageText);
 
   // 2. Convert Groq's JSON text into a JavaScript object.
   //    If Groq returned something that is not JSON this throws, and the

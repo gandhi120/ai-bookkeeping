@@ -32,7 +32,8 @@ function check(name, actual, expected) {
 }
 
 // Pushes one transaction all the way through the real confirmation flow.
-async function submitAndConfirm(user, msgId, transaction) {
+// typeOverride simulates the shopkeeper tapping a clarification button.
+async function submitAndConfirm(user, msgId, transaction, typeOverride = null) {
   let saved = await createMessage({
     user_id: user.id,
     telegram_message_id: msgId,
@@ -42,7 +43,7 @@ async function submitAndConfirm(user, msgId, transaction) {
   await updateMessageStatus(saved.id, "PROCESSING");
   await updateMessageTransactionData(saved.id, { ...transaction, telegram_message_id: msgId });
   await updateMessageStatus(saved.id, "PENDING_CONFIRMATION");
-  return { saved, result: await confirmMessageTransaction(saved.id, user.id) };
+  return { saved, result: await confirmMessageTransaction(saved.id, user.id, typeOverride) };
 }
 
 function txn(type, person, amount, description) {
@@ -143,6 +144,47 @@ try {
     "SELECT customer_id FROM transactions WHERE user_id=$1 AND telegram_message_id='5008'", [userA.id]
   )).rows[0];
   check("supplier payment has NULL customer_id", supplier.customer_id, null);
+
+  // The blocker fix: "Received 5000 from Raj" arrives as payment_received and
+  // the shopkeeper's button decides what it really was. Both answers are
+  // driven from the SAME stored transaction_data, so the override is what
+  // must reach the database — not the AI's original guess.
+  console.log("\n--- Ambiguous payment clarified as UDHAAR REPAYMENT ---");
+  const before = await getCustomerBalance(userA.id, rajA.id);
+  await submitAndConfirm(
+    userA, 5009, txn("payment_received", "Raj", 200, "received from Raj"), "repayment"
+  );
+  const repaid = (await pool.query(
+    "SELECT transaction_type, customer_id FROM transactions WHERE user_id=$1 AND telegram_message_id='5009'", [userA.id]
+  )).rows[0];
+  check("stored as repayment, not the AI's payment_received", repaid.transaction_type, "repayment");
+  check("linked to Raj's khata", repaid.customer_id, rajA.id);
+  check("balance dropped by 200", await getCustomerBalance(userA.id, rajA.id), before - 200);
+
+  console.log("\n--- Ambiguous payment clarified as NORMAL PAYMENT ---");
+  const beforeIncome = await getCustomerBalance(userA.id, rajA.id);
+  await submitAndConfirm(
+    userA, 5010, txn("payment_received", "Raj", 700, "received from Raj"), "payment_received"
+  );
+  const income = (await pool.query(
+    "SELECT transaction_type, customer_id, person FROM transactions WHERE user_id=$1 AND telegram_message_id='5010'", [userA.id]
+  )).rows[0];
+  check("stored as payment_received", income.transaction_type, "payment_received");
+  check("NOT linked to a khata", income.customer_id, null);
+  check("person is still recorded", income.person, "Raj");
+  check("balance unmoved", await getCustomerBalance(userA.id, rajA.id), beforeIncome);
+
+  console.log("\n--- Double tap on a clarification button ---");
+  const { saved: clarifySaved, result: firstTap } = await submitAndConfirm(
+    userA, 5011, txn("payment_received", "Raj", 100, "double tapped"), "repayment"
+  );
+  const secondTap = await confirmMessageTransaction(clarifySaved.id, userA.id, "payment_received");
+  check("first tap succeeds", firstTap.success, true);
+  check("second tap refused", secondTap.reason, "ALREADY_PROCESSED");
+  const tapRows = (await pool.query(
+    "SELECT COUNT(*)::int c FROM transactions WHERE user_id=$1 AND telegram_message_id='5011'", [userA.id]
+  )).rows[0].c;
+  check("exactly ONE row despite two different answers", tapRows, 1);
 
 } finally {
   console.log("\n--- CLEANUP ---");

@@ -63,6 +63,28 @@ function today() {
   });
 }
 
+// Money from a NAMED person, where the message never said what it was for.
+// "Received ₹5000 from Raj" might settle Raj's udhaar or might be ordinary
+// income. Only the shopkeeper knows, and guessing wrong silently changes
+// what a customer owes — so we ask instead of deciding.
+//
+// The AI only produces payment_received + a person for exactly this case:
+// anything that states it settles a debt comes back as `repayment`.
+function needsPaymentClarification(transaction) {
+  return (
+    transaction.transaction_type === "payment_received" &&
+    Boolean(transaction.person)
+  );
+}
+
+// Maps a clarification button to the transaction type it means.
+// Callback data arrives from the user's Telegram client, so this lookup is
+// the whitelist: anything not listed here can never reach the database.
+const CLARIFIED_TYPE = {
+  repayment: "repayment",
+  income: "payment_received",
+};
+
 // --------------------------------------------------
 // /monthly
 // --------------------------------------------------
@@ -439,6 +461,72 @@ Outstanding: ${money(balance)}`
   );
 }
 
+// Asks the shopkeeper what an ambiguous payment was actually for.
+//
+// Nothing is written here. The message is already saved as
+// PENDING_CONFIRMATION with its transaction data, so the answer can arrive
+// after a restart — the buttons carry only the Telegram message id, and
+// everything else is looked up again in PostgreSQL.
+//
+// The customer's current outstanding is shown because that is the number
+// the shopkeeper needs in order to answer correctly.
+async function askPaymentClarification(
+  chatId,
+  user,
+  transaction,
+  telegramMessageId
+) {
+  const customer = await getCustomerByName(user.id, transaction.person);
+
+  // A customer with no khata yet still gets the question: the shopkeeper may
+  // have given the udhaar verbally before ever recording it here.
+  const khataLine = customer
+    ? `\n${transaction.person} currently owes: ${money(
+        await getCustomerBalance(user.id, customer.id)
+      )}`
+    : `\n${transaction.person} has no udhaar recorded yet.`;
+
+  await bot.sendMessage(
+    chatId,
+    `📝 Please confirm
+
+Amount: ${money(transaction.amount)}
+From: ${transaction.person}
+Description: ${transaction.description}
+Date: ${new Date(transaction.transaction_date).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: "Asia/Kolkata",
+    })}
+${khataLine}
+
+❓ Did ${transaction.person} pay this toward their udhaar, or is this a normal payment?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📒 Udhaar Repayment",
+              callback_data: `repayment:${telegramMessageId}`,
+            },
+            {
+              text: "💰 Normal Payment",
+              callback_data: `income:${telegramMessageId}`,
+            },
+          ],
+          [
+            {
+              text: "❌ Cancel",
+              callback_data: `cancel:${telegramMessageId}`,
+            },
+          ],
+        ],
+      },
+    }
+  );
+}
+
 // --------------------------------------------------
 // Normal transaction messages
 // --------------------------------------------------
@@ -522,6 +610,19 @@ bot.on("message", async (message) => {
       savedMessage.id,
       "PENDING_CONFIRMATION"
     );
+
+    // The AI could not tell what this money was for. Ask before offering to
+    // save anything — a wrong guess here would move a customer's balance.
+    if (needsPaymentClarification(result.transaction)) {
+      await askPaymentClarification(
+        message.chat.id,
+        user,
+        result.transaction,
+        message.message_id
+      );
+
+      return;
+    }
 
     // For udhaar entries, show what the customer owes right now so the
     // shopkeeper can see the before/after before committing to it.
@@ -620,6 +721,10 @@ bot.on("callback_query", async (query) => {
 
     const telegramMessageId = Number(messageId);
 
+    // Set only when the shopkeeper answered the "what was this money for?"
+    // question. null for a plain Confirm, which keeps the AI's own type.
+    const typeOverride = CLARIFIED_TYPE[action] ?? null;
+
     // Get the shopkeeper who clicked the button.
     const user = await resolveShopkeeper(query.from, query.message.chat);
 
@@ -661,6 +766,17 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
+    // An ambiguous payment can only be saved through a clarification button.
+    // The plain Confirm button is never shown for one, but callback data
+    // comes from the user's client, so refuse it here rather than trust that.
+    if (action === "confirm" && needsPaymentClarification(transaction)) {
+      await bot.answerCallbackQuery(query.id, {
+        text: "Please choose what this payment was for.",
+      });
+
+      return;
+    }
+
     // --------------------------------------------------
     // Cancel
     // --------------------------------------------------
@@ -689,15 +805,17 @@ bot.on("callback_query", async (query) => {
     }
 
     // --------------------------------------------------
-    // Confirm
+    // Confirm (or a clarification button, which confirms and chooses
+    // the meaning in the same tap)
     // --------------------------------------------------
 
-    if (action === "confirm") {
+    if (action === "confirm" || typeOverride) {
       // Confirm the message and create the transaction
       // atomically inside PostgreSQL.
       const result = await confirmMessageTransaction(
         savedMessage.id,
-        user.id
+        user.id,
+        typeOverride
       );
 
       // The message was not found.
@@ -747,9 +865,16 @@ bot.on("callback_query", async (query) => {
             savedTransaction.customer_id
           );
 
-          khataLine = `\n\n📒 ${savedTransaction.person} now owes ${money(
-            balance
-          )}`;
+          // A repayment can overshoot the debt, leaving a negative balance.
+          // "owes ₹-4,000" reads as nonsense to a shopkeeper, so a negative
+          // is phrased as advance money held — matching how the balance
+          // question answers it.
+          khataLine =
+            balance < 0
+              ? `\n\n📒 ${savedTransaction.person} has paid ${money(
+                  Math.abs(balance)
+                )} in advance`
+              : `\n\n📒 ${savedTransaction.person} now owes ${money(balance)}`;
         }
 
         // Replace the confirmation message with the saved result.
