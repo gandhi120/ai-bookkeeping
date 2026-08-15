@@ -3,14 +3,20 @@ import "dotenv/config";
 
 import { processTransaction } from "../services/transaction.service.js";
 import { getDailySummary } from "../services/summary.service.js";
+
 import {
   getTransactionsByDate,
   createTransaction,
   findOrCreateUser,
   createMessage,
   updateMessageStatus,
+  updateMessageTransactionData,
+  getMessageByTelegramMessageId,
+  confirmMessageTransaction,
 } from "../database/postgres.js";
+
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
+
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
 // Creates a Telegram bot instance.
@@ -20,15 +26,13 @@ const bot = new TelegramBot(token, {
   polling: true,
 });
 
-// Stores transactions waiting for user confirmation.
-const pendingTransactions = new Map();
-
 console.log("Telegram bot is running...");
 
 // --------------------------------------------------
 // /monthly
 // --------------------------------------------------
 
+// Generates and sends the current month's financial summary.
 bot.onText(/^\/monthly$/, async (message) => {
   try {
     const now = new Date();
@@ -82,6 +86,7 @@ Transactions: ${summary.transactionCount}`
 // /start
 // --------------------------------------------------
 
+// Sends the welcome message and available commands.
 bot.onText(/^\/start$/, async (message) => {
   await bot.sendMessage(
     message.chat.id,
@@ -108,6 +113,7 @@ Commands:
 // /help
 // --------------------------------------------------
 
+// Sends the available bot commands and usage examples.
 bot.onText(/^\/help$/, async (message) => {
   await bot.sendMessage(
     message.chat.id,
@@ -132,6 +138,7 @@ Commands:
 // /transactions
 // --------------------------------------------------
 
+// Fetches and displays today's transactions for the user.
 bot.onText(/^\/transactions$/, async (message) => {
   try {
     const today = new Date().toLocaleDateString("en-CA", {
@@ -180,6 +187,7 @@ ${transactionList}`
 // /summary
 // --------------------------------------------------
 
+// Generates and sends today's financial summary.
 bot.onText(/^\/summary$/, async (message) => {
   try {
     const today = new Date().toLocaleDateString("en-CA", {
@@ -221,33 +229,32 @@ bot.on("message", async (message) => {
     return;
   }
 
-  const user = await findOrCreateUser({
-    telegram_user_id: message.from.id,
-    telegram_chat_id: message.chat.id,
-    first_name: message.from.first_name,
-    username: message.from.username,
-  });
-
-  console.log("User:", user);
-
-  // Save every incoming Telegram message.
-  const savedMessage = await createMessage({
-    user_id: user.id,
-    telegram_message_id: message.message_id,
-    message_text: message.text,
-    status: "RECEIVED",
-  });
-
-  console.log("Message saved:", savedMessage);
-
-  // Mark the message as currently being processed by AI.
-  await updateMessageStatus(
-    savedMessage.id,
-    "PROCESSING"
-  );
-
   try {
-    console.log("Message received:", message.text);
+    // Find or create the application user from Telegram information.
+    const user = await findOrCreateUser({
+      telegram_user_id: message.from.id,
+      telegram_chat_id: message.chat.id,
+      first_name: message.from.first_name,
+      username: message.from.username,
+    });
+
+    console.log("User:", user);
+
+    // Save every incoming Telegram message permanently.
+    const savedMessage = await createMessage({
+      user_id: user.id,
+      telegram_message_id: message.message_id,
+      message_text: message.text,
+      status: "RECEIVED",
+    });
+
+    console.log("Message saved:", savedMessage);
+
+    // Mark the message as currently being processed by AI.
+    await updateMessageStatus(
+      savedMessage.id,
+      "PROCESSING"
+    );
 
     // Process the message using Groq and validate the result with Zod.
     const result = await processTransaction(
@@ -260,24 +267,20 @@ bot.on("message", async (message) => {
       result
     );
 
+    // Store the AI-generated transaction data in PostgreSQL.
+    // This replaces the need to keep the transaction in memory.
+    await updateMessageTransactionData(
+      savedMessage.id,
+      result.transaction
+    );
+
     // AI processing succeeded, so wait for user confirmation.
     await updateMessageStatus(
       savedMessage.id,
       "PENDING_CONFIRMATION"
     );
 
-    // Store the transaction and database message ID
-    // until the user confirms or cancels it.
-    pendingTransactions.set(
-      message.message_id,
-      {
-        ...result.transaction,
-        user_id: user.id,
-        message_id: savedMessage.id,
-      }
-    );
-
-    // Show transaction preview with Confirm / Cancel buttons.
+    // Show the transaction preview with Confirm / Cancel buttons.
     await bot.sendMessage(
       message.chat.id,
       `📝 Please confirm
@@ -319,10 +322,14 @@ Date: ${new Date(
     );
 
     // Mark the message as failed because AI processing failed.
-    await updateMessageStatus(
-      savedMessage.id,
-      "FAILED"
-    );
+    // savedMessage is available because it is created before
+    // the AI processing starts.
+    if (typeof savedMessage !== "undefined" && savedMessage) {
+      await updateMessageStatus(
+        savedMessage.id,
+        "FAILED"
+      );
+    }
 
     await bot.sendMessage(
       message.chat.id,
@@ -335,18 +342,32 @@ Date: ${new Date(
 // Confirm / Cancel buttons
 // --------------------------------------------------
 
+// Handles Confirm / Cancel button clicks using PostgreSQL
+// as the source of truth instead of an in-memory Map.
 bot.on("callback_query", async (query) => {
   try {
     const [action, messageId] = query.data.split(":");
 
     const telegramMessageId = Number(messageId);
 
-    // Get the pending transaction.
-    const transaction =
-      pendingTransactions.get(telegramMessageId);
+    // Get the Telegram user who clicked the button.
+    const user = await findOrCreateUser({
+      telegram_user_id: query.from.id,
+      telegram_chat_id: query.message.chat.id,
+      first_name: query.from.first_name,
+      username: query.from.username,
+    });
 
-    // Transaction no longer exists in memory.
-    if (!transaction) {
+    // Retrieve the original message and its transaction data
+    // from PostgreSQL.
+    const savedMessage =
+      await getMessageByTelegramMessageId(
+        user.id,
+        telegramMessageId
+      );
+
+    // The message does not exist in PostgreSQL.
+    if (!savedMessage) {
       await bot.answerCallbackQuery(query.id, {
         text: "Transaction not found.",
       });
@@ -354,65 +375,124 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    // ----------------------------------------------
+    // Only a pending transaction can be confirmed or cancelled.
+    if (savedMessage.status !== "PENDING_CONFIRMATION") {
+      await bot.answerCallbackQuery(query.id, {
+        text: `Transaction already ${savedMessage.status.toLowerCase()}.`,
+      });
+
+      return;
+    }
+
+    // The AI-generated transaction data is stored in PostgreSQL.
+    const transaction = savedMessage.transaction_data;
+
+    // Make sure transaction data exists before continuing.
+    if (!transaction) {
+      await bot.answerCallbackQuery(query.id, {
+        text: "Transaction data not found.",
+      });
+
+      return;
+    }
+
+    // --------------------------------------------------
     // Cancel
-    // ----------------------------------------------
+    // --------------------------------------------------
 
     if (action === "cancel") {
-       // Mark the original Telegram message as cancelled.
-        await updateMessageStatus(
-          transaction.message_id,
-          "CANCELLED"
-        );
-          pendingTransactions.delete(telegramMessageId);
+      // Mark the original Telegram message as cancelled.
+      await updateMessageStatus(
+        savedMessage.id,
+        "CANCELLED"
+      );
 
-          await bot.answerCallbackQuery(query.id, {
-            text: "Transaction cancelled.",
-          });
+      await bot.answerCallbackQuery(query.id, {
+        text: "Transaction cancelled.",
+      });
 
-          await bot.editMessageText(
-            "❌ Transaction cancelled.",
-            {
-              chat_id: query.message.chat.id,
-              message_id: query.message.message_id,
-            }
-          );
+      // Replace the confirmation message with the cancellation result.
+      await bot.editMessageText(
+        "❌ Transaction cancelled.",
+        {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+        }
+      );
 
-          return;
+      return;
     }
 
-    // ----------------------------------------------
+    // --------------------------------------------------
     // Confirm
-    // ----------------------------------------------
+    // --------------------------------------------------
 
     if (action === "confirm") {
-      const savedTransaction =
-        await createTransaction(transaction);
-      
-        // Mark the original Telegram message as confirmed.
-        await updateMessageStatus(
-          transaction.message_id,
-          "CONFIRMED"
+      // Confirm the message and create the transaction
+      // atomically inside PostgreSQL.
+      const result = await confirmMessageTransaction(
+        savedMessage.id,
+        user.id
+      );
+
+      // The message was not found.
+      if (result.reason === "NOT_FOUND") {
+        await bot.answerCallbackQuery(query.id, {
+          text: "Transaction not found.",
+        });
+
+        return;
+      }
+
+      // The message was already confirmed, cancelled,
+      // or otherwise processed.
+      if (result.reason === "ALREADY_PROCESSED") {
+        await bot.answerCallbackQuery(query.id, {
+          text: `Transaction already ${result.status.toLowerCase()}.`,
+        });
+
+        return;
+      }
+
+      // Transaction data is missing from the message.
+      if (result.reason === "TRANSACTION_DATA_MISSING") {
+        await bot.answerCallbackQuery(query.id, {
+          text: "Transaction data not found.",
+        });
+
+        return;
+      }
+
+      // The transaction was successfully created
+      // and the message was marked as CONFIRMED.
+      if (result.success) {
+        const savedTransaction = result.transaction;
+
+        await bot.answerCallbackQuery(query.id, {
+          text: "Transaction saved!",
+        });
+
+        // Replace the confirmation message with the saved result.
+        await bot.editMessageText(
+          `✅ Transaction saved
+
+Type: ${savedTransaction.transaction_type}
+Description: ${savedTransaction.description}
+Amount: ₹${savedTransaction.amount}`,
+          {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id,
+          }
         );
 
-          pendingTransactions.delete(telegramMessageId);
-
-          await bot.answerCallbackQuery(query.id, {
-            text: "Transaction saved!",
-          });
-
-          await bot.editMessageText(
-            `✅ Transaction saved
-
-                Type: ${savedTransaction.transaction_type}
-                Description: ${savedTransaction.description}
-                Amount: ₹${savedTransaction.amount}`,
-                {
-                  chat_id: query.message.chat.id,
-                  message_id: query.message.message_id,
-                }
-          );
+        return;
+      }
     }
+
+    // Unknown callback action.
+    await bot.answerCallbackQuery(query.id, {
+      text: "Unknown action.",
+    });
   } catch (error) {
     console.error(
       "Confirmation error:",
@@ -429,6 +509,7 @@ bot.on("callback_query", async (query) => {
 // Telegram polling errors
 // --------------------------------------------------
 
+// Handles errors reported by Telegram polling.
 bot.on("polling_error", (error) => {
   console.error(
     "Telegram polling error:",

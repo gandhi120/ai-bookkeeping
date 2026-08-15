@@ -3,6 +3,13 @@ import "dotenv/config";
 
 const { Pool } = pg;
 
+
+// Returns a dedicated PostgreSQL client for
+// operations that need to run inside one transaction.
+export async function getDatabaseClient() {
+  return await pool.connect();
+}
+
 // Creates a connection pool.
 // The pool manages PostgreSQL connections for our Node.js app.
 export const pool = new Pool({
@@ -150,4 +157,183 @@ export async function updateMessageStatus(messageId, status) {
   );
 
   return result.rows[0];
+}
+
+// Stores the AI-generated transaction data for a message.
+export async function updateMessageTransactionData(
+  messageId,
+  transactionData
+) {
+  const result = await pool.query(
+    `
+    UPDATE messages
+    SET
+      transaction_data = $1::jsonb,
+      updated_at = NOW()
+    WHERE id = $2
+    RETURNING *;
+    `,
+    [
+      JSON.stringify(transactionData),
+      messageId,
+    ]
+  );
+
+  return result.rows[0];
+}
+
+// Finds a Telegram message belonging to a user.
+export async function getMessageByTelegramMessageId(
+  userId,
+  telegramMessageId
+) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM messages
+    WHERE user_id = $1
+      AND telegram_message_id = $2;
+    `,
+    [userId, telegramMessageId]
+  );
+
+  return result.rows[0];
+}
+
+
+// Confirms a pending message and creates its transaction atomically.
+// Both database changes succeed together or both are rolled back.
+export async function confirmMessageTransaction(
+  messageId,
+  userId
+) {
+  const client = await pool.connect();
+
+  try {
+    // Start the PostgreSQL transaction.
+    await client.query("BEGIN");
+
+    // Lock the message row so two Confirm requests
+    // cannot process the same message at the same time.
+    const messageResult = await client.query(
+      `
+      SELECT
+        id,
+        user_id,
+        status,
+        transaction_data
+      FROM messages
+      WHERE id = $1
+        AND user_id = $2
+      FOR UPDATE;
+      `,
+      [messageId, userId]
+    );
+
+    const message = messageResult.rows[0];
+
+    // Message doesn't exist.
+    if (!message) {
+      await client.query("ROLLBACK");
+
+      return {
+        success: false,
+        reason: "NOT_FOUND",
+      };
+    }
+
+    // Message was already confirmed/cancelled/failed.
+    if (message.status !== "PENDING_CONFIRMATION") {
+      await client.query("ROLLBACK");
+
+      return {
+        success: false,
+        reason: "ALREADY_PROCESSED",
+        status: message.status,
+      };
+    }
+
+    // Transaction data should exist before confirmation.
+    if (!message.transaction_data) {
+      await client.query("ROLLBACK");
+
+      return {
+        success: false,
+        reason: "TRANSACTION_DATA_MISSING",
+      };
+    }
+
+    // Create the final transaction using the same database client.
+    const transactionResult = await client.query(
+      `
+      INSERT INTO transactions (
+        user_id,
+        transaction_type,
+        description,
+        category,
+        quantity,
+        amount,
+        person,
+        transaction_date,
+        notes,
+        telegram_message_id
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8::date,
+        $9,
+        $10
+      )
+      RETURNING *;
+      `,
+      [
+        userId,
+        message.transaction_data.transaction_type,
+        message.transaction_data.description,
+        message.transaction_data.category,
+        message.transaction_data.quantity,
+        message.transaction_data.amount,
+        message.transaction_data.person,
+        message.transaction_data.transaction_date,
+        message.transaction_data.notes,
+        message.transaction_data.telegram_message_id,
+      ]
+    );
+
+    const transaction = transactionResult.rows[0];
+
+    // Mark the original message as confirmed.
+    await client.query(
+      `
+      UPDATE messages
+      SET
+        status = 'CONFIRMED',
+        updated_at = NOW()
+      WHERE id = $1;
+      `,
+      [message.id]
+    );
+
+    // Both operations succeeded.
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      transaction,
+    };
+  } catch (error) {
+    // Something failed, so undo everything in this transaction.
+    await client.query("ROLLBACK");
+
+    throw error;
+  } finally {
+    // Always return the connection to the pool.
+    client.release();
+  }
 }
