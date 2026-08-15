@@ -20,6 +20,7 @@ Note: `src/server.js` does not import the bot — the Fastify server and the Tel
 npm test         # tests/schema.test.js — Zod validator. No DB, no API key, free.
 npm run test:db  # tests/udhaar.integration.js — real Postgres. Needs DATABASE_URL.
 npm run test:ws  # tests/workspace.integration.js — workspace isolation. Needs DATABASE_URL.
+npm run test:onb # tests/onboarding.integration.js — onboarding + practice-data cleanup. Needs DATABASE_URL.
 npm run test:ai  # tests/ai.test.js — live AI classification. Needs an API key, costs calls.
 ```
 
@@ -51,6 +52,64 @@ A user keeps one or more ledgers: a `shopkeeper` workspace, a `household` worksp
 - **The workspace is stamped on the message at arrival and read back off the locked row at confirmation**, never from the user's current setting. Otherwise switching workspaces between typing and tapping Confirm would misfile the transaction.
 - **The AI is instructed, never trusted.** The prompt is told which types exist; `isTypeAllowedInWorkspace()` in `src/schemas/transaction.schema.js` is what actually enforces it, so a hallucinated `credit_sale` on a grocery message cannot open a khata.
 - `transactions.workspace_id` is deliberately nullable: rows predating `ebcb1a0` have no `user_id`, so they cannot be backfilled. They are invisible to every query either way — see `migrations/002_workspaces.sql`.
+
+## Onboarding
+
+A new user is walked through recording one **real** transaction, then offered
+the chance to delete it so their real books open at zero.
+
+- **It never assumes `/start`.** Most people open a bot and type "hii". Every
+  command and the free-text handler check `if (!workspace)` and route to
+  `askToChooseWorkspace()`, so onboarding begins from any first contact. That
+  check runs *before* the AI call, so a first message costs nothing.
+- **Choosing a workspace is the gate.** No workspace means no ledger, so
+  nothing else in the bot can run until the question is answered. This is why
+  the picker is sent from ten places rather than one.
+- **Two columns hold all the state, and there is no step counter.**
+  `users.onboarding_done_at` (NULL = still onboarding) and
+  `messages.is_onboarding` (stamped at insert, the key the cleanup deletes by).
+  Which step the user is on is carried by the button they tap next
+  (`onb:summary`, `onb:finish`, `onb:clear`, `onb:keep`) — the same pattern as
+  `confirm:` / `cancel:` / `addws:`.
+- **`transactions` has no onboarding flag.** Practice transactions are reached
+  by joining back to the message that created them. That join **must cast**:
+  `messages.telegram_message_id` is `bigint` while
+  `transactions.telegram_message_id` is `text`.
+- **`finishOnboarding()` is the only function in `src/` that deletes anything.**
+  Everything is scoped `WHERE user_id = $1`, gated on `is_onboarding`, and run
+  in one transaction. It deletes leaves-first (transactions → messages →
+  customers left with no ledger) because those FKs are `NO ACTION`, not
+  cascade. **`users` and `workspaces` are never touched** — the workspace is
+  what onboarding created. Balances need no repair since `getCustomerBalance`
+  is a `SUM` over the ledger.
+- **"Keep it" clears the flags** rather than leaving them set, so data the user
+  chose to keep can never be deleted by a later call.
+- **The count is the safety rail.** Everything typed while onboarding is open
+  is flagged, so a user who ignores the finish button accumulates real data
+  under the practice flag. The clear prompt states the exact number
+  ("You have 47 practice entries"), which is what makes a wrong tap visible.
+- **The feature tour is buttons, not steps.** After the practice entry is
+  confirmed, one card offers every other feature the ledger has; each tap runs
+  the *real* command against the user's own data and re-offers the card. So
+  the whole product is covered without adding a single required step — trying
+  everything takes about ten seconds, trying nothing takes one tap. It appears
+  only *after* a confirmed transaction, because `/summary` and `/monthly` have
+  no empty state and would otherwise open on a wall of ₹0.
+- **`FEATURES_BY_WORKSPACE` in `src/schemas/transaction.schema.js` is the one
+  place that declares what each ledger can DO**, as `TYPES_BY_WORKSPACE` beside
+  it declares what each can RECORD. The tour builds its buttons from
+  `featuresForWorkspace()`, so a household is never offered a khata. It is
+  `?? []` fail-closed, and it is pure — which is the only way to test any of
+  this, since importing `bot.js` starts the bot polling.
+- **`TOUR` in `bot.js` holds each feature's label and handler in one entry**,
+  rather than a label map beside an action map that could drift and caption a
+  button "undefined". `ONBOARDING_STEPS` is derived from its keys: a step
+  missing from that whitelist does not reach "Unknown action", it falls
+  through to the transaction path and reports "Transaction not found."
+- **Skip is an alias for finish, not a second path.** The skip button carries
+  `onb:finish`, so it ends onboarding and still offers to clear anything
+  already recorded. It appears from the practice prompt onward but never on
+  the ledger question — with no workspace the user can do nothing at all.
 
 ## Key design points
 

@@ -17,6 +17,7 @@ import {
   CUSTOMER_TRANSACTION_TYPES,
   WORKSPACE_TYPES,
   HOUSEHOLD_CATEGORIES,
+  featuresForWorkspace,
 } from "../src/schemas/transaction.schema.js";
 
 let passed = 0;
@@ -287,6 +288,75 @@ check("household categories are clean enough to put in a prompt", () => {
     assert.equal(category.trim(), category, `"${category}" has stray whitespace`);
     assert.ok(category.length > 0, "empty category");
   }
+});
+
+// --------------------------------------------------
+// featuresForWorkspace — what each ledger can DO
+// --------------------------------------------------
+//
+// This is the list the onboarding tour builds its buttons from, so it is also
+// the answer to "does each ledger offer all its features?". Asserting on it
+// here is the only way to check that without tapping through Telegram:
+// importing bot.js would start the bot polling.
+
+// Every feature the tour knows how to run. Mirrors the keys of TOUR in
+// src/telegram/bot.js — a feature offered to a workspace but missing there
+// would render a button that does nothing.
+const RUNNABLE_FEATURES = ["summary", "monthly", "transactions", "udhaar"];
+
+check("a shop offers every feature", () => {
+  assert.deepEqual(featuresForWorkspace("shopkeeper"), [
+    "summary",
+    "monthly",
+    "transactions",
+    "udhaar",
+  ]);
+});
+
+check("a household offers the three it can use", () => {
+  assert.deepEqual(featuresForWorkspace("household"), [
+    "summary",
+    "monthly",
+    "transactions",
+  ]);
+});
+
+check("a household is never offered udhaar", () => {
+  // A home has no customers, so a khata button would open a feature that
+  // cannot work — isTypeAllowedInWorkspace already refuses the transactions
+  // behind it.
+  assert.ok(!featuresForWorkspace("household").includes("udhaar"));
+});
+
+check("both ledgers can read their money back", () => {
+  // The three reporting features are the essential set: whatever else
+  // differs, neither ledger may be missing a way to see what it recorded.
+  for (const type of WORKSPACE_TYPES) {
+    for (const essential of ["summary", "monthly", "transactions"]) {
+      assert.ok(
+        featuresForWorkspace(type).includes(essential),
+        `${type} is missing ${essential}`
+      );
+    }
+  }
+});
+
+check("every offered feature is one the tour can run", () => {
+  for (const type of WORKSPACE_TYPES) {
+    for (const feature of featuresForWorkspace(type)) {
+      assert.ok(
+        RUNNABLE_FEATURES.includes(feature),
+        `${type} offers "${feature}", which no tour button can run`
+      );
+    }
+  }
+});
+
+check("an unknown workspace type offers nothing", () => {
+  // Fail closed, like isTypeAllowedInWorkspace: a typo must not hand out
+  // every feature.
+  assert.deepEqual(featuresForWorkspace("bank"), []);
+  assert.deepEqual(featuresForWorkspace(undefined), []);
 });
 
 console.log(

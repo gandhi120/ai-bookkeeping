@@ -39,6 +39,30 @@ const TYPES_BY_WORKSPACE = {
   household: ["expense", "income", "other"],
 };
 
+// What each ledger can DO, as opposed to TYPES_BY_WORKSPACE above, which is
+// what it can RECORD.
+//
+// Both ledgers read their money back the same three ways. Only the khata is
+// exclusive to a shop, because only a shop has customers — a household has
+// nobody to lend to.
+//
+// This is the single place that answers "does this ledger have all its
+// features?". The onboarding tour builds its buttons from it, so a feature
+// added here appears in the tour for exactly the ledgers listed.
+const FEATURES_BY_WORKSPACE = {
+  shopkeeper: ["summary", "monthly", "transactions", "udhaar"],
+  household: ["summary", "monthly", "transactions"],
+};
+
+// Returns the features a workspace type offers, in the order they should be
+// shown.
+//
+// `?? []` so an unknown type offers nothing rather than everything — the same
+// fail-closed default as isTypeAllowedInWorkspace().
+export function featuresForWorkspace(workspaceType) {
+  return FEATURES_BY_WORKSPACE[workspaceType] ?? [];
+}
+
 // Categories offered to the household prompt. A plain list, not a table:
 // adding one is a one-line edit and nothing references them by id.
 export const HOUSEHOLD_CATEGORIES = [

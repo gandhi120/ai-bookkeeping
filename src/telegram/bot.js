@@ -3,7 +3,10 @@ import "dotenv/config";
 
 import { processMessage } from "../services/transaction.service.js";
 import { getDailySummary } from "../services/summary.service.js";
-import { isCustomerTransaction } from "../schemas/transaction.schema.js";
+import {
+  isCustomerTransaction,
+  featuresForWorkspace,
+} from "../schemas/transaction.schema.js";
 
 import {
   getTransactionsByDate,
@@ -21,6 +24,8 @@ import {
   getActiveWorkspace,
   createWorkspace,
   setActiveWorkspace,
+  countOnboardingTransactions,
+  finishOnboarding,
 } from "../database/postgres.js";
 
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
@@ -71,23 +76,92 @@ function workspaceLabel(workspace) {
   return `${WORKSPACE_KINDS[workspace.type].icon} ${workspace.name}`;
 }
 
-// Sent whenever a handler needs a workspace and the user has none yet.
-// Returning the buttons rather than a bare error means onboarding can start
-// from any command, not just /start.
-async function askToChooseWorkspace(chatId) {
+// ONBOARDING STEP 1 — the gate. Sent whenever a handler needs a workspace and
+// the user has none yet.
+//
+// No workspace means no ledger, so nothing else in the bot can run: every
+// command and every message routes here until a choice is made. That is what
+// makes onboarding unskippable, and it is why this is sent from ten different
+// places rather than only from /start — most people never type /start, they
+// just say "hii".
+//
+// It greets and explains before it asks. A first-time user who typed "hii"
+// has no idea what this bot is, and being handed two bare buttons is where
+// they quit. The options are labelled by what the user gets, not by the word
+// "workspace", which no shopkeeper thinks in.
+async function askToChooseWorkspace(chatId, user) {
+  // first_name is optional on Telegram accounts, so fall back to no name
+  // rather than greeting "Hi undefined".
+  const greeting = user?.first_name ? `Hi ${user.first_name}!` : "Hello!";
+
   await bot.sendMessage(
     chatId,
-    `👋 What do you want to manage?
+    `👋 ${greeting} I'm your bookkeeping assistant.
 
-🏪 Shop — track your business
-🏠 Household — track your personal/family money
+Just type what happened — like "Bought 10 kg rice for ₹600" — and I'll
+write it in your books. No forms, no Excel.
 
-You can add the other one later.`,
+First, what should I keep books for?
+
+You can add the other one later, so this is not final.`,
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🏪 Shop", callback_data: "addws:shopkeeper" }],
-          [{ text: "🏠 Household", callback_data: "addws:household" }],
+          [
+            {
+              text: "🏪 My Shop — sales, purchases, udhaar",
+              callback_data: "addws:shopkeeper",
+            },
+          ],
+          [
+            {
+              text: "🏠 My Home — household spending",
+              callback_data: "addws:household",
+            },
+          ],
+        ],
+      },
+    }
+  );
+}
+
+// True until the user finishes onboarding.
+//
+// Read off the users row that resolveShopkeeper already fetched, so asking
+// this costs no extra query. There is no step counter: which step the user is
+// on is carried by the button they tap next (onb:summary, onb:finish, ...),
+// the same way confirm:/cancel:/addws: already work.
+function isOnboarding(user) {
+  return !user.onboarding_done_at;
+}
+
+// The practice message we ask a new user to type, per ledger type.
+// A purchase for the shop and a grocery expense for the home: both are the
+// most ordinary entry that ledger will ever see, so the example is one they
+// will actually repeat tomorrow.
+const PRACTICE_EXAMPLE = {
+  shopkeeper: "Bought 10 kg rice for ₹600",
+  household: "Bought groceries for ₹500",
+};
+
+// ONBOARDING STEP 2 — asks the user to type their first real transaction.
+//
+// Carries a skip button, because nobody should be held in a tutorial they did
+// not ask for. Skip points at `onb:finish` — the same step the Finish button
+// uses — so skipping is not a separate path with its own rules: it ends
+// onboarding, and still offers to clear anything already recorded.
+async function sendPracticePrompt(chatId, workspace) {
+  await bot.sendMessage(
+    chatId,
+    `Let's try it once — takes 30 seconds.
+
+Type this, or your own version:
+
+${PRACTICE_EXAMPLE[workspace.type]}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "⏭ Skip setup", callback_data: "onb:finish" }],
         ],
       },
     }
@@ -168,12 +242,190 @@ async function handleWorkspaceAction(query, action, value) {
     message_id: query.message.message_id,
   });
 
+  // ONBOARDING STEP 2. A first-time user has just answered the only question
+  // the bot cannot work without, so instead of a one-line hint they get walked
+  // through recording something. Somebody adding a SECOND workspace later is
+  // not new and keeps the short hint.
+  if (isOnboarding(user)) {
+    await bot.sendMessage(chatId, `${workspaceLabel(workspace)} is ready.`);
+
+    await sendPracticePrompt(chatId, workspace);
+
+    return;
+  }
+
   await bot.sendMessage(
     chatId,
     workspace.type === "household"
       ? `Send me your household spending, like "Bought groceries for ₹500" or "Salary received ₹65,000".`
       : `Send me your shop transactions, like "Sold 5 shirts for ₹2,500" or "Raj took goods for ₹2,000 on udhaar".`
   );
+}
+
+// ONBOARDING STEP 4 — sent right after the practice transaction is saved.
+//
+// This is the moment the user has seen the whole loop work, so the tour is
+// offered here and nowhere earlier: every command below now has at least one
+// real row to show. /summary and /monthly have no empty state, so offering
+// them before anything is recorded would introduce the user to their own
+// books as a wall of ₹0.
+//
+// Every feature the tour can show: its button text and the function that
+// runs it, in one entry each.
+//
+// One table rather than a label map beside an action map, so a feature can
+// never have a button with no handler or a handler with no label — the second
+// would send Telegram a button captioned "undefined".
+//
+// WHICH of these a given user sees comes from featuresForWorkspace(), so a
+// household is never offered a khata.
+const TOUR = {
+  summary: { label: "📊 Today's summary", run: sendDailySummary },
+  monthly: { label: "📅 This month", run: sendMonthlySummary },
+  transactions: { label: "📋 Today's entries", run: sendTransactionsList },
+  udhaar: { label: "📒 Who owes me", run: sendUdhaarList },
+};
+
+// ONBOARDING STEP 4/5 — the feature tour.
+//
+// Buttons rather than steps. Everything here is optional, so a user who wants
+// out taps Finish once and a user who is curious sees every feature run
+// against their own data in about ten seconds. That is what keeps "takes 30
+// seconds" honest while still covering the whole product.
+async function sendFeatureTour(chatId, workspace, intro) {
+  const featureRows = featuresForWorkspace(workspace.type).map((feature) => [
+    { text: TOUR[feature].label, callback_data: `onb:${feature}` },
+  ]);
+
+  await bot.sendMessage(chatId, intro, {
+    reply_markup: {
+      inline_keyboard: [
+        ...featureRows,
+        [{ text: "✅ Finish setup", callback_data: "onb:finish" }],
+      ],
+    },
+  });
+}
+
+// ONBOARDING STEP 6 — the confirmation before anything is deleted.
+//
+// The COUNT is the safety rail, not decoration. Everything typed while
+// onboarding is open counts as practice, so a user who ignored the finish
+// button for a week would be clearing real work. "You have 47 practice
+// entries" is what makes that visible before the tap, and Keep is offered
+// with equal weight.
+async function askToClearPracticeData(chatId, count) {
+  const entries = count === 1 ? "1 practice entry" : `${count} practice entries`;
+
+  await bot.sendMessage(
+    chatId,
+    `Almost done.
+
+You have ${entries} in your books from setup. Clear them so your real accounts start from zero?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🧹 Clear practice data", callback_data: "onb:clear" }],
+          [{ text: "📌 Keep it", callback_data: "onb:keep" }],
+        ],
+      },
+    }
+  );
+}
+
+// The only onboarding steps that exist. Callback data is user-supplied, so
+// this list is the whitelist: `onb:` with anything else is not routed at all.
+//
+// Every tour feature must appear here or its button silently does nothing
+// useful — an unlisted step does not reach "Unknown action", it falls through
+// to the transaction path and reports "Transaction not found."
+const ONBOARDING_STEPS = [
+  ...Object.keys(TOUR),
+  "finish",
+  "clear",
+  "keep",
+];
+
+// Handles every onb:* button — the onboarding steps after the workspace has
+// been created.
+//
+// Callback data comes from the user's Telegram client and is never trusted:
+// only the steps above exist, anything else falls through to the caller's
+// "Unknown action". `finish` and `clear`/`keep` are separate steps on purpose,
+// so deleting data always takes a deliberate second tap.
+async function handleOnboardingAction(query, step) {
+  const chatId = query.message.chat.id;
+
+  const { user, workspace } = await resolveShopkeeper(
+    query.from,
+    query.message.chat
+  );
+
+  // Onboarding is already over — the buttons are on an old message someone
+  // scrolled back to. Say so rather than clearing anything.
+  if (!isOnboarding(user)) {
+    await bot.answerCallbackQuery(query.id, { text: "Setup is already done." });
+
+    return;
+  }
+
+  // A tour button: run the real command against their own data, then offer
+  // the card again so trying a second feature is one tap, not a hunt.
+  if (TOUR[step]) {
+    await bot.answerCallbackQuery(query.id);
+
+    await TOUR[step].run(chatId, user, workspace);
+
+    await sendFeatureTour(chatId, workspace, "What else?");
+
+    return;
+  }
+
+  if (step === "finish") {
+    await bot.answerCallbackQuery(query.id);
+
+    const count = await countOnboardingTransactions(user.id);
+
+    // Nothing was ever recorded, so there is nothing to ask about. Close
+    // onboarding straight away rather than asking to clear zero rows.
+    if (count === 0) {
+      await finishOnboarding(user.id, { clear: false });
+
+      await bot.sendMessage(chatId, `✅ All set.`);
+
+      await sendWelcomeHelp(chatId, workspace);
+
+      return;
+    }
+
+    await askToClearPracticeData(chatId, count);
+
+    return;
+  }
+
+  // Only `clear` and `keep` remain, and both end onboarding. Anything else
+  // never reaches here — the caller's whitelist decides what gets this far.
+  const clear = step === "clear";
+
+  const result = await finishOnboarding(user.id, { clear });
+
+  await bot.answerCallbackQuery(query.id, {
+    text: clear ? "Practice data cleared." : "Setup complete.",
+  });
+
+  await bot.editMessageText(
+    clear
+      ? `✅ All set. Cleared ${result.transactions} practice ${
+          result.transactions === 1 ? "entry" : "entries"
+        }.`
+      : `✅ All set. Your practice entries are kept.`,
+    {
+      chat_id: chatId,
+      message_id: query.message.message_id,
+    }
+  );
+
+  await sendWelcomeHelp(chatId, workspace);
 }
 
 // Maps a clarification button to the transaction type it means.
@@ -188,6 +440,72 @@ const CLARIFIED_TYPE = {
 // /monthly
 // --------------------------------------------------
 
+// Builds and sends this month's dashboard for one workspace.
+//
+// Split out of the /monthly command so the onboarding tour can run the real
+// thing from a button. Assumes a workspace exists — the callers gate on that.
+async function sendMonthlySummary(chatId, user, workspace) {
+  const now = new Date();
+
+  const year = Number(
+    now.toLocaleDateString("en-IN", {
+      year: "numeric",
+      timeZone: "Asia/Kolkata",
+    })
+  );
+
+  const month = Number(
+    now.toLocaleDateString("en-IN", {
+      month: "numeric",
+      timeZone: "Asia/Kolkata",
+    })
+  );
+
+  const summary = await getMonthlySummary(
+    user.id,
+    workspace.id,
+    year,
+    month,
+    workspace.type
+  );
+
+  const monthName = now.toLocaleDateString("en-IN", {
+    month: "long",
+    year: "numeric",
+    timeZone: "Asia/Kolkata",
+  });
+
+  // A household reports income against expenses and where the money went;
+  // a shop reports sales against purchases. Different questions, so the
+  // dashboard is not one layout with some rows blanked out.
+  const body =
+    workspace.type === "household"
+      ? `Income: ${money(summary.totalIncome)}
+Expenses: ${money(summary.totalExpenses)}
+Balance: ${money(summary.balance)}${
+          summary.byCategory.length > 0
+            ? `\n\nWhere it went:\n${summary.byCategory
+                .map((row) => `${row.category} — ${money(row.total)}`)
+                .join("\n")}`
+            : ""
+        }`
+      : `Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}`;
+
+  await bot.sendMessage(
+    chatId,
+    `📊 ${workspaceLabel(workspace)} — Monthly Summary
+
+${monthName}
+
+${body}
+
+Transactions: ${summary.transactionCount}`
+  );
+}
+
 // Generates and sends the current month's financial summary.
 bot.onText(/^\/monthly$/, async (message) => {
   try {
@@ -198,70 +516,12 @@ bot.onText(/^\/monthly$/, async (message) => {
     );
 
     if (!workspace) {
-      await askToChooseWorkspace(message.chat.id);
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
     }
 
-    const now = new Date();
-
-    const year = Number(
-      now.toLocaleDateString("en-IN", {
-        year: "numeric",
-        timeZone: "Asia/Kolkata",
-      })
-    );
-
-    const month = Number(
-      now.toLocaleDateString("en-IN", {
-        month: "numeric",
-        timeZone: "Asia/Kolkata",
-      })
-    );
-
-    const summary = await getMonthlySummary(
-      user.id,
-      workspace.id,
-      year,
-      month,
-      workspace.type
-    );
-
-    const monthName = now.toLocaleDateString("en-IN", {
-      month: "long",
-      year: "numeric",
-      timeZone: "Asia/Kolkata",
-    });
-
-    // A household reports income against expenses and where the money went;
-    // a shop reports sales against purchases. Different questions, so the
-    // dashboard is not one layout with some rows blanked out.
-    const body =
-      workspace.type === "household"
-        ? `Income: ${money(summary.totalIncome)}
-Expenses: ${money(summary.totalExpenses)}
-Balance: ${money(summary.balance)}${
-            summary.byCategory.length > 0
-              ? `\n\nWhere it went:\n${summary.byCategory
-                  .map((row) => `${row.category} — ${money(row.total)}`)
-                  .join("\n")}`
-              : ""
-          }`
-        : `Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}`;
-
-    await bot.sendMessage(
-      message.chat.id,
-      `📊 ${workspaceLabel(workspace)} — Monthly Summary
-
-${monthName}
-
-${body}
-
-Transactions: ${summary.transactionCount}`
-    );
+    await sendMonthlySummary(message.chat.id, user, workspace);
   } catch (error) {
     console.error("Monthly summary error:", error);
 
@@ -276,22 +536,13 @@ Transactions: ${summary.transactionCount}`
 // /start
 // --------------------------------------------------
 
-// Sends the welcome message and available commands.
-//
-// A user with no workspace is onboarded instead: they pick a shop or a
-// household and are never forced to create both.
-bot.onText(/^\/start$/, async (message) => {
-  const { workspace } = await resolveShopkeeper(message.from, message.chat);
-
-  if (!workspace) {
-    await askToChooseWorkspace(message.chat.id);
-
-    return;
-  }
-
+// The "here is how to use me" text for a workspace, sent by /start and again
+// at the end of onboarding. One function rather than two copies so the two
+// can never drift apart as commands are added.
+async function sendWelcomeHelp(chatId, workspace) {
   if (workspace.type === "household") {
     await bot.sendMessage(
-      message.chat.id,
+      chatId,
       `👋 You're in ${workspaceLabel(workspace)}.
 
 Just send me your household spending in normal language.
@@ -314,7 +565,7 @@ Commands:
   }
 
   await bot.sendMessage(
-    message.chat.id,
+    chatId,
     `👋 You're in ${workspaceLabel(workspace)}.
 
 Just send me your shop transactions in normal language.
@@ -344,6 +595,34 @@ Commands:
 /workspace - Switch between shop and home
 /help - Show available commands`
   );
+}
+
+// Sends the welcome message and available commands.
+//
+// A user with no workspace is onboarded instead: they pick a shop or a
+// household and are never forced to create both. A user who is mid-onboarding
+// gets the practice prompt again rather than the full command list — they
+// have not recorded anything yet, so a list of commands is noise, and the
+// finish button here is the escape hatch for someone who never types.
+bot.onText(/^\/start$/, async (message) => {
+  const { user, workspace } = await resolveShopkeeper(
+    message.from,
+    message.chat
+  );
+
+  if (!workspace) {
+    await askToChooseWorkspace(message.chat.id, user);
+
+    return;
+  }
+
+  if (isOnboarding(user)) {
+    await sendPracticePrompt(message.chat.id, workspace);
+
+    return;
+  }
+
+  await sendWelcomeHelp(message.chat.id, workspace);
 });
 
 // --------------------------------------------------
@@ -361,7 +640,7 @@ bot.onText(/^\/workspace$/, async (message) => {
     const workspaces = await getWorkspaces(user.id);
 
     if (workspaces.length === 0) {
-      await askToChooseWorkspace(message.chat.id);
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
     }
@@ -406,7 +685,22 @@ bot.onText(/^\/workspace$/, async (message) => {
 // --------------------------------------------------
 
 // Sends the available bot commands and usage examples.
+//
+// Checks for a workspace like every other command: a brand new user handed a
+// list of commands for a ledger that does not exist yet has been shown the
+// menu of a restaurant they have not walked into.
 bot.onText(/^\/help$/, async (message) => {
+  const { user, workspace } = await resolveShopkeeper(
+    message.from,
+    message.chat
+  );
+
+  if (!workspace) {
+    await askToChooseWorkspace(message.chat.id, user);
+
+    return;
+  }
+
   await bot.sendMessage(
     message.chat.id,
     `🤖 Bookkeeping Assistant
@@ -448,6 +742,45 @@ Commands:
 // /transactions
 // --------------------------------------------------
 
+// Builds and sends today's entry list for one workspace.
+//
+// Split out of the /transactions command so the onboarding tour can run the
+// real thing from a button. Assumes a workspace exists.
+async function sendTransactionsList(chatId, user, workspace) {
+  const date = today();
+
+  const transactions = await getTransactionsByDate(user.id, workspace.id, date);
+
+  if (transactions.length === 0) {
+    await bot.sendMessage(
+      chatId,
+      `📋 No transactions found for ${date} in ${workspaceLabel(workspace)}.`
+    );
+
+    return;
+  }
+
+  const transactionList = transactions
+    .map(
+      (transaction, index) =>
+        `${index + 1}. ${transaction.transaction_type.toUpperCase()}
+${transaction.description} — ${money(transaction.amount)}
+Category: ${transaction.category}${
+          transaction.person ? `\nCustomer: ${transaction.person}` : ""
+        }`
+    )
+    .join("\n\n");
+
+  await bot.sendMessage(
+    chatId,
+    `📋 ${workspaceLabel(workspace)} — Today's Transactions
+
+Date: ${date}
+
+${transactionList}`
+  );
+}
+
 // Fetches and displays today's transactions for the user.
 bot.onText(/^\/transactions$/, async (message) => {
   try {
@@ -458,47 +791,12 @@ bot.onText(/^\/transactions$/, async (message) => {
     );
 
     if (!workspace) {
-      await askToChooseWorkspace(message.chat.id);
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
     }
 
-    const date = today();
-
-    const transactions = await getTransactionsByDate(
-      user.id,
-      workspace.id,
-      date
-    );
-
-    if (transactions.length === 0) {
-      await bot.sendMessage(
-        message.chat.id,
-        `📋 No transactions found for ${date} in ${workspaceLabel(workspace)}.`
-      );
-
-      return;
-    }
-
-    const transactionList = transactions
-      .map(
-        (transaction, index) =>
-          `${index + 1}. ${transaction.transaction_type.toUpperCase()}
-${transaction.description} — ${money(transaction.amount)}
-Category: ${transaction.category}${
-            transaction.person ? `\nCustomer: ${transaction.person}` : ""
-          }`
-      )
-      .join("\n\n");
-
-    await bot.sendMessage(
-      message.chat.id,
-      `📋 ${workspaceLabel(workspace)} — Today's Transactions
-
-Date: ${date}
-
-${transactionList}`
-    );
+    await sendTransactionsList(message.chat.id, user, workspace);
   } catch (error) {
     console.error("Transactions error:", error);
 
@@ -513,6 +811,41 @@ ${transactionList}`
 // /summary
 // --------------------------------------------------
 
+// Builds and sends today's summary for one workspace.
+//
+// Split out of the /summary command so the onboarding "See today's summary"
+// button shows the real thing rather than a mock-up of it — the point of that
+// step is to prove the entry they just made actually landed.
+async function sendDailySummary(chatId, user, workspace) {
+  const summary = await getDailySummary(
+    user.id,
+    workspace.id,
+    today(),
+    workspace.type
+  );
+
+  const body =
+    workspace.type === "household"
+      ? `Income: ${money(summary.totalIncome)}
+Expenses: ${money(summary.totalExpenses)}
+Balance: ${money(summary.balance)}`
+      : `Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}`;
+
+  await bot.sendMessage(
+    chatId,
+    `📊 ${workspaceLabel(workspace)} — Daily Summary
+
+Date: ${summary.date}
+
+${body}
+
+Transactions: ${summary.transactionCount}`
+  );
+}
+
 // Generates and sends today's financial summary.
 bot.onText(/^\/summary$/, async (message) => {
   try {
@@ -523,38 +856,12 @@ bot.onText(/^\/summary$/, async (message) => {
     );
 
     if (!workspace) {
-      await askToChooseWorkspace(message.chat.id);
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
     }
 
-    const summary = await getDailySummary(
-      user.id,
-      workspace.id,
-      today(),
-      workspace.type
-    );
-
-    const body =
-      workspace.type === "household"
-        ? `Income: ${money(summary.totalIncome)}
-Expenses: ${money(summary.totalExpenses)}
-Balance: ${money(summary.balance)}`
-        : `Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}`;
-
-    await bot.sendMessage(
-      message.chat.id,
-      `📊 ${workspaceLabel(workspace)} — Daily Summary
-
-Date: ${summary.date}
-
-${body}
-
-Transactions: ${summary.transactionCount}`
-    );
+    await sendDailySummary(message.chat.id, user, workspace);
   } catch (error) {
     console.error("Summary error:", error);
 
@@ -569,6 +876,62 @@ Transactions: ${summary.transactionCount}`
 // /udhaar
 // --------------------------------------------------
 
+// Builds and sends the khata — everyone who still owes this shopkeeper money.
+//
+// Split out of the /udhaar command so the onboarding tour can run the real
+// thing from a button. The shop-only check stays INSIDE this function rather
+// than in the command wrapper, so a forged `onb:udhaar` from a household user
+// is refused at the same place the command refuses it.
+async function sendUdhaarList(chatId, user, workspace) {
+  // Udhaar is a khata, and only a shop keeps one.
+  if (workspace.type !== "shopkeeper") {
+    await bot.sendMessage(
+      chatId,
+      "📒 Udhaar is a shop feature. Switch to your shop with /workspace to see who owes you money."
+    );
+
+    return;
+  }
+
+  const customers = await getAllOutstanding(user.id);
+
+  if (customers.length === 0) {
+    // Says how a khata is created rather than only that there isn't one.
+    // "Everyone has cleared their balance" reads as a mistake to a shopkeeper
+    // who has never lent to anybody — which is exactly who taps this during
+    // onboarding.
+    await bot.sendMessage(
+      chatId,
+      `📒 Nobody owes you money right now.
+
+When you record something like "Raj took goods for ₹2,000 on udhaar", Raj will appear here until he pays it back.`
+    );
+
+    return;
+  }
+
+  const total = customers.reduce(
+    (sum, customer) => sum + Number(customer.outstanding),
+    0
+  );
+
+  const list = customers
+    .map(
+      (customer, index) =>
+        `${index + 1}. ${customer.name} — ${money(customer.outstanding)}`
+    )
+    .join("\n");
+
+  await bot.sendMessage(
+    chatId,
+    `📒 Udhaar Book
+
+${list}
+
+Total pending: ${money(total)}`
+  );
+}
+
 // Shows every customer who still owes this shopkeeper money.
 bot.onText(/^\/udhaar$/, async (message) => {
   try {
@@ -577,47 +940,16 @@ bot.onText(/^\/udhaar$/, async (message) => {
       message.chat
     );
 
-    // Udhaar is a khata, and only a shop keeps one.
-    if (!workspace || workspace.type !== "shopkeeper") {
-      await bot.sendMessage(
-        message.chat.id,
-        "📒 Udhaar is a shop feature. Switch to your shop with /workspace to see who owes you money."
-      );
+    // A user with NO workspace gets the ledger question, like every other
+    // command. Telling them to "switch to your shop" was a dead end: they do
+    // not have a shop to switch to yet.
+    if (!workspace) {
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
     }
 
-    const customers = await getAllOutstanding(user.id);
-
-    if (customers.length === 0) {
-      await bot.sendMessage(
-        message.chat.id,
-        "📒 No pending udhaar. Everyone has cleared their balance."
-      );
-
-      return;
-    }
-
-    const total = customers.reduce(
-      (sum, customer) => sum + Number(customer.outstanding),
-      0
-    );
-
-    const list = customers
-      .map(
-        (customer, index) =>
-          `${index + 1}. ${customer.name} — ${money(customer.outstanding)}`
-      )
-      .join("\n");
-
-    await bot.sendMessage(
-      message.chat.id,
-      `📒 Udhaar Book
-
-${list}
-
-Total pending: ${money(total)}`
-    );
+    await sendUdhaarList(message.chat.id, user, workspace);
   } catch (error) {
     console.error("Udhaar list error:", error);
 
@@ -804,8 +1136,16 @@ ${khataLine}
 // --------------------------------------------------
 
 bot.on("message", async (message) => {
+  // Stickers, photos, voice notes and locations have no `text` at all. Without
+  // this they fall straight past the command check below (`undefined?.` is
+  // undefined, not true) and reach createMessage with a NULL message_text,
+  // which the column rejects. A 👋 sticker is a very common first contact.
+  if (!message.text) {
+    return;
+  }
+
   // Ignore Telegram commands.
-  if (message.text?.startsWith("/")) {
+  if (message.text.startsWith("/")) {
     return;
   }
 
@@ -813,6 +1153,10 @@ bot.on("message", async (message) => {
   // block scoped and would be invisible to catch{}, so the FAILED status
   // could never be written.
   let savedMessage;
+
+  // Set only while the sender is still onboarding, for the same scoping
+  // reason: the catch below needs it to answer a beginner differently.
+  let onboardingWorkspace;
 
   try {
     // Find or create the shopkeeper from Telegram information.
@@ -824,9 +1168,13 @@ bot.on("message", async (message) => {
     // Without a workspace there is no ledger to write to. Ask before
     // spending an AI call on a message that has nowhere to go.
     if (!workspace) {
-      await askToChooseWorkspace(message.chat.id);
+      await askToChooseWorkspace(message.chat.id, user);
 
       return;
+    }
+
+    if (isOnboarding(user)) {
+      onboardingWorkspace = workspace;
     }
 
     // Save every incoming Telegram message permanently.
@@ -836,6 +1184,9 @@ bot.on("message", async (message) => {
       telegram_message_id: message.message_id,
       message_text: message.text,
       status: "RECEIVED",
+      // Stamped at arrival, not read back later: this is what marks the row
+      // as practice data, and it is the key the cleanup deletes by.
+      is_onboarding: isOnboarding(user),
     });
 
     // createMessage uses ON CONFLICT DO NOTHING, so a redelivered Telegram
@@ -866,16 +1217,23 @@ bot.on("message", async (message) => {
     // question asked at home, or a type this workspace cannot record. Say so
     // plainly instead of failing with a generic apology.
     if (result.intent === "unsupported") {
-      await bot.sendMessage(
-        message.chat.id,
-        result.reason === "CUSTOMER_QUERY_OUTSIDE_SHOP"
-          ? `That's a customer question, and ${workspaceLabel(
-              workspace
-            )} has no customers. Switch to your shop with /workspace.`
-          : `I couldn't record that in ${workspaceLabel(
-              workspace
-            )}. Try rephrasing, or switch workspace with /workspace.`
-      );
+      // Mid-tutorial this is almost always a greeting, not a real attempt at
+      // bookkeeping. Repeating the practice prompt keeps a brand new user on
+      // the rails; advice about /workspace means nothing to them yet.
+      if (isOnboarding(user)) {
+        await sendPracticePrompt(message.chat.id, workspace);
+      } else {
+        await bot.sendMessage(
+          message.chat.id,
+          result.reason === "CUSTOMER_QUERY_OUTSIDE_SHOP"
+            ? `That's a customer question, and ${workspaceLabel(
+                workspace
+              )} has no customers. Switch to your shop with /workspace.`
+            : `I couldn't record that in ${workspaceLabel(
+                workspace
+              )}. Try rephrasing, or switch workspace with /workspace.`
+        );
+      }
 
       await updateMessageStatus(savedMessage.id, "ANSWERED");
 
@@ -1009,6 +1367,15 @@ Date: ${new Date(
       );
     }
 
+    // A beginner who typed "hii" during the tutorial gets the practice prompt
+    // back, not an apology about a transaction they never tried to record.
+    // The message is still marked FAILED above either way.
+    if (onboardingWorkspace) {
+      await sendPracticePrompt(message.chat.id, onboardingWorkspace);
+
+      return;
+    }
+
     await bot.sendMessage(
       message.chat.id,
       "Sorry, I couldn't process that transaction."
@@ -1035,14 +1402,27 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
+    // Onboarding buttons carry a step name for the same reason, and are
+    // whitelisted here so a forged payload can only ever be one of four.
+    if (action === "onb" && ONBOARDING_STEPS.includes(messageId)) {
+      await handleOnboardingAction(query, messageId);
+
+      return;
+    }
+
     const telegramMessageId = Number(messageId);
 
     // Set only when the shopkeeper answered the "what was this money for?"
     // question. null for a plain Confirm, which keeps the AI's own type.
     const typeOverride = CLARIFIED_TYPE[action] ?? null;
 
-    // Get the shopkeeper who clicked the button.
-    const { user } = await resolveShopkeeper(query.from, query.message.chat);
+    // Get the shopkeeper who clicked the button. `workspace` is needed only
+    // by the onboarding tour below, which picks its buttons from the ledger
+    // type.
+    const { user, workspace } = await resolveShopkeeper(
+      query.from,
+      query.message.chat
+    );
 
     // Retrieve the original message and its transaction data
     // from PostgreSQL.
@@ -1205,6 +1585,21 @@ Amount: ${money(savedTransaction.amount)}${khataLine}`,
             message_id: query.message.message_id,
           }
         );
+
+        // ONBOARDING STEP 4. The user has now seen the full loop work, so
+        // follow the saved entry with the way out of the tutorial. This
+        // reappears after every confirm until they answer it, which is what
+        // stops somebody living in onboarding for a week with all their real
+        // entries flagged as practice.
+        if (isOnboarding(user)) {
+          await sendFeatureTour(
+            query.message.chat.id,
+            workspace,
+            `🎉 That's the whole app — type it, tap Confirm.
+
+Want to see what else I can do?`
+          );
+        }
 
         return;
       }
