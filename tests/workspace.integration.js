@@ -16,7 +16,10 @@ import {
   updateMessageTransactionData,
   confirmMessageTransaction,
   getCustomerByName,
+  getCustomerBalance,
+  getAllOutstanding,
   getTransactionsByDate,
+  getTransactionsByMonth,
   getWorkspaces,
   getActiveWorkspace,
   createWorkspace,
@@ -24,10 +27,14 @@ import {
 } from "../src/database/postgres.js";
 
 import { getDailySummary } from "../src/services/summary.service.js";
+import { getMonthlySummary } from "../src/services/monthly-summary.service.js";
 
 const U_TG = 999000003;
 const OTHER_TG = 999000004;
 const TODAY = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+// The month TODAY falls in, so the /monthly checks look at the rows we just
+// created rather than at whatever month the wall clock happens to be in.
+const [YEAR, MONTH] = TODAY.split("-").map(Number);
 
 let passed = 0;
 let failed = 0;
@@ -163,6 +170,93 @@ try {
   check("shop now has 3 rows", (await getTransactionsByDate(user.id, shop.id, TODAY)).length, 3);
   check("home still has 3 rows", (await getTransactionsByDate(user.id, home.id, TODAY)).length, 3);
 
+  console.log("\n--- /monthly is workspace-scoped too ---");
+  // Only getTransactionsByDate was covered before, which left the entire
+  // /monthly data path unverified — the command most likely to leak the
+  // groceries into the shop, because it spans more days than /summary.
+  const monthShop = await getTransactionsByMonth(user.id, shop.id, YEAR, MONTH);
+  const monthHome = await getTransactionsByMonth(user.id, home.id, YEAR, MONTH);
+  check("month view: no home row in the shop", monthShop.every(r => r.workspace_id === shop.id), true);
+  check("month view: no shop row in the home", monthHome.every(r => r.workspace_id === home.id), true);
+  check("month view: shop has no groceries", monthShop.some(r => r.category === "groceries"), false);
+  check("month view: home has no udhaar", monthHome.some(r => r.transaction_type === "credit_sale"), false);
+
+  const monthlyHome = await getMonthlySummary(user.id, home.id, YEAR, MONTH, "household");
+  check("monthly household income", monthlyHome.totalIncome, 65000);
+  check("monthly household expenses", monthlyHome.totalExpenses, 2900);
+  check("monthly household breakdown is ordered", monthlyHome.byCategory.map(c => c.category), ["electricity", "groceries"]);
+
+  const monthlyShop = await getMonthlySummary(user.id, shop.id, YEAR, MONTH, "shopkeeper");
+  check("monthly shop total excludes the household entirely", monthlyShop.totalExpenses, 0);
+
+  console.log("\n--- The database itself refuses an unfiled message ---");
+  // App code always stamps workspace_id, but a future caller might forget.
+  // This proves the NOT NULL from migration 002 is real, not just respected.
+  let rejected = false;
+  try {
+    await pool.query(
+      "INSERT INTO messages (user_id, telegram_message_id, message_text, status) VALUES ($1,$2,$3,$4)",
+      [user.id, 6100, "no workspace", "RECEIVED"]
+    );
+  } catch {
+    rejected = true;
+  }
+  check("a message with no workspace_id cannot be inserted", rejected, true);
+
+  console.log("\n--- Two users, two households, no leaking ---");
+  // Isolation was proven WITHIN one user. This proves it across the tenant
+  // boundary, where the workspace ids differ AND the user ids differ.
+  const otherHome = await createWorkspace(other.id, "My Home", "household");
+  await setActiveWorkspace(other.id, otherHome.id);
+  await submitAndConfirm(other, otherHome, 6200, txn("expense", 111, "their groceries", "groceries"));
+
+  check("other user's home has its own row", (await getTransactionsByDate(other.id, otherHome.id, TODAY)).length, 1);
+  check("our home is unchanged by theirs", (await getTransactionsByDate(user.id, home.id, TODAY)).length, 3);
+  check("we cannot read their home with our user id", (await getTransactionsByDate(user.id, otherHome.id, TODAY)).length, 0);
+  check("they cannot read our home with their user id", (await getTransactionsByDate(other.id, home.id, TODAY)).length, 0);
+
+  console.log("\n--- Both users may own a workspace of the same type ---");
+  // The unique index is (user_id, type). If the user_id half were ever
+  // dropped, the second user's shop would collide with the first user's.
+  check("their shop is a different row from ours", otherShop.id !== shop.id, true);
+  check("their home is a different row from ours", otherHome.id !== home.id, true);
+
+  console.log("\n--- Cancel in a household creates nothing ---");
+  const homeCancel = await createMessage({
+    user_id: user.id,
+    workspace_id: home.id,
+    telegram_message_id: 6300,
+    message_text: "cancel this",
+    status: "RECEIVED",
+  });
+  await updateMessageTransactionData(homeCancel.id, { ...txn("expense", 999, "cancelled snack", "food"), telegram_message_id: 6300 });
+  await updateMessageStatus(homeCancel.id, "PENDING_CONFIRMATION");
+  await updateMessageStatus(homeCancel.id, "CANCELLED");
+  const homeCancelled = await confirmMessageTransaction(homeCancel.id, user.id);
+  check("confirm after cancel is refused at home too", homeCancelled.reason, "ALREADY_PROCESSED");
+  check("home still has 3 rows after the cancel", (await getTransactionsByDate(user.id, home.id, TODAY)).length, 3);
+
+  console.log("\n--- A name in a household entry is just a note ---");
+  // `person` is a free string the AI can populate ("gave Ramesh 500"). At
+  // home it must stay a note and never resolve into a khata.
+  await submitAndConfirm(user, home, 6400, txn("expense", 250, "lunch with Ramesh", "food", "Ramesh"));
+  check("no customer named Ramesh was created", !!(await getCustomerByName(user.id, "Ramesh")), false);
+  const rameshRow = (await pool.query(
+    "SELECT person, customer_id FROM transactions WHERE user_id=$1 AND telegram_message_id='6400'", [user.id]
+  )).rows[0];
+  check("the name is still recorded on the row", rameshRow.person, "Ramesh");
+  check("but it is linked to no khata", rameshRow.customer_id, null);
+
+  console.log("\n--- Khata totals ignore household spending ---");
+  // getAllOutstanding and getCustomerBalance are user-scoped, not
+  // workspace-scoped, because customers belong to the user. That is only
+  // safe as long as household rows can never carry a customer_id.
+  const raj = await getCustomerByName(user.id, "Raj");
+  check("Raj still owes exactly the credit sale", await getCustomerBalance(user.id, raj.id), 2000);
+  const owing = await getAllOutstanding(user.id);
+  check("only one customer owes anything", owing.length, 1);
+  check("and the amount is untouched by groceries", Number(owing[0].outstanding), 2000);
+
 } finally {
   console.log("\n--- CLEANUP ---");
   for (const u of [user, other]) {
@@ -179,8 +273,16 @@ try {
     "SELECT COUNT(*)::int c FROM users WHERE telegram_user_id IN ($1,$2)", [U_TG, OTHER_TG]
   )).rows[0].c;
   console.log(`  test users remaining: ${left} (should be 0)`);
-  const orphanWorkspaces = (await pool.query("SELECT COUNT(*)::int c FROM workspaces")).rows[0].c;
-  console.log(`  workspaces table now: ${orphanWorkspaces} rows`);
+  // Count the workspaces THIS TEST could have left behind, not every row in
+  // the table — a real user's own workspaces live here too, and reporting the
+  // raw total makes a healthy run look like a leak.
+  const leaked = (await pool.query(
+    `SELECT COUNT(*)::int c FROM workspaces w
+     JOIN users u ON u.id = w.user_id
+     WHERE u.telegram_user_id IN ($1,$2)`,
+    [U_TG, OTHER_TG]
+  )).rows[0].c;
+  console.log(`  test workspaces leaked: ${leaked} (should be 0)`);
   await pool.end();
 }
 

@@ -8,9 +8,10 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "bot": "node src/telegram/bot.js",
-    "test": "node tests/schema.test.js",
+    "test": "node tests/schema.test.js && node tests/summary.test.js",
     "test:db": "node tests/udhaar.integration.js",
     "test:ws": "node tests/workspace.integration.js",
+    "test:all": "npm test && npm run test:db && npm run test:ws",
     "test:ai": "node tests/ai.test.js"
   },
   "repository": {

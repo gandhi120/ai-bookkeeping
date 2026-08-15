@@ -14,6 +14,9 @@ import {
   isCustomerTransaction,
   isTypeAllowedInWorkspace,
   TRANSACTION_TYPES,
+  CUSTOMER_TRANSACTION_TYPES,
+  WORKSPACE_TYPES,
+  HOUSEHOLD_CATEGORIES,
 } from "../src/schemas/transaction.schema.js";
 
 let passed = 0;
@@ -192,6 +195,98 @@ check("an unknown workspace type accepts nothing", () => {
 check("expense is the one type both ledgers share", () => {
   assert.equal(isTypeAllowedInWorkspace("shopkeeper", "expense"), true);
   assert.equal(isTypeAllowedInWorkspace("household", "expense"), true);
+});
+
+console.log("\nThe type lists still agree with each other:");
+
+// These do not test behaviour. They test that the several lists in
+// transaction.schema.js have not drifted apart — the failure mode you only
+// notice weeks later, when a message fails with a generic apology.
+
+check("every declared type belongs to at least one workspace", () => {
+  // Add a type to TRANSACTION_TYPES and forget TYPES_BY_WORKSPACE, and you
+  // get a type the AI may emit and Zod will happily accept, but that no
+  // workspace can record. The user sees "I couldn't record that" with no clue.
+  for (const type of TRANSACTION_TYPES) {
+    const allowed = WORKSPACE_TYPES.some((workspace) =>
+      isTypeAllowedInWorkspace(workspace, type)
+    );
+
+    assert.equal(
+      allowed,
+      true,
+      `"${type}" is in TRANSACTION_TYPES but no workspace accepts it — add it to TYPES_BY_WORKSPACE`
+    );
+  }
+});
+
+check("no workspace allows a type the schema does not know", () => {
+  // The mirror of the check above: a typo inside TYPES_BY_WORKSPACE would
+  // permit a type that Zod then rejects further down the pipeline.
+  for (const workspace of WORKSPACE_TYPES) {
+    for (const type of TRANSACTION_TYPES.concat(["refund", "loan", ""])) {
+      if (TRANSACTION_TYPES.includes(type)) continue;
+
+      assert.equal(
+        isTypeAllowedInWorkspace(workspace, type),
+        false,
+        `${workspace} accepts "${type}", which is not a declared transaction type`
+      );
+    }
+  }
+});
+
+check("only a shop can record a type that touches a khata", () => {
+  // The standing product rule — a household has no customers — asserted from
+  // the data rather than trusted. If a customer type ever became legal at
+  // home, confirmMessageTransaction would open a khata from a grocery bill.
+  for (const type of CUSTOMER_TRANSACTION_TYPES) {
+    assert.equal(isTypeAllowedInWorkspace("shopkeeper", type), true, type);
+
+    for (const workspace of WORKSPACE_TYPES) {
+      if (workspace === "shopkeeper") continue;
+
+      assert.equal(
+        isTypeAllowedInWorkspace(workspace, type),
+        false,
+        `${workspace} can record "${type}", which would open a khata`
+      );
+    }
+  }
+});
+
+check("every workspace accepts at least one type", () => {
+  // Catches a workspace added to the enum but never wired up: it would
+  // reject every single message the user sends into it.
+  for (const workspace of WORKSPACE_TYPES) {
+    const usable = TRANSACTION_TYPES.filter((type) =>
+      isTypeAllowedInWorkspace(workspace, type)
+    );
+
+    assert.ok(
+      usable.length > 0,
+      `workspace "${workspace}" accepts nothing — it is in WORKSPACE_TYPES but missing from TYPES_BY_WORKSPACE`
+    );
+  }
+});
+
+check("household categories are clean enough to put in a prompt", () => {
+  // This list is interpolated straight into the household system prompt, so
+  // a duplicate wastes tokens and a capitalised entry teaches the model to
+  // emit a category that will not match the others when grouped.
+  assert.ok(HOUSEHOLD_CATEGORIES.length > 0, "no categories to offer");
+
+  assert.equal(
+    new Set(HOUSEHOLD_CATEGORIES).size,
+    HOUSEHOLD_CATEGORIES.length,
+    "duplicate category"
+  );
+
+  for (const category of HOUSEHOLD_CATEGORIES) {
+    assert.equal(category, category.toLowerCase(), `"${category}" is not lowercase`);
+    assert.equal(category.trim(), category, `"${category}" has stray whitespace`);
+    assert.ok(category.length > 0, "empty category");
+  }
 });
 
 console.log(

@@ -9,6 +9,7 @@
 import "dotenv/config";
 
 import { processMessage } from "../src/services/transaction.service.js";
+import { isTypeAllowedInWorkspace } from "../src/schemas/transaction.schema.js";
 
 // Each case: the message a shopkeeper types, and what we expect back.
 // `person: undefined` means "we don't care", null means "must be null".
@@ -85,6 +86,23 @@ const CASES = [
   // than letting it through as a query.
   { workspace: "household", text: "How much does Raj owe me?", intent: "unsupported" },
 ];
+
+// Pre-flight: check the CASES table against itself before spending a single
+// API call on it. A case expecting `income` under `shopkeeper` is a broken
+// TEST, not a broken model — but at runtime it would look like a
+// classification failure, after paying for the call to find out.
+for (const [index, testCase] of CASES.entries()) {
+  const workspace = testCase.workspace ?? "shopkeeper";
+
+  if (testCase.type && !isTypeAllowedInWorkspace(workspace, testCase.type)) {
+    console.error(
+      `\nBROKEN TEST CASE #${index}: "${testCase.text}"\n` +
+        `  expects type "${testCase.type}", which is not legal in a ${workspace} workspace.\n`
+    );
+
+    process.exit(1);
+  }
+}
 
 let passed = 0;
 let failed = 0;
