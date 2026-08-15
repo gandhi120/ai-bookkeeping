@@ -6,9 +6,9 @@ import { getDailySummary } from "../services/summary.service.js";
 import {
   getTransactionsByDate,
   createTransaction,
+  findOrCreateUser,
 } from "../database/postgres.js";
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
-
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
 // Creates a Telegram bot instance.
@@ -219,6 +219,15 @@ bot.on("message", async (message) => {
     return;
   }
 
+  const user = await findOrCreateUser({
+    telegram_user_id: message.from.id,
+    telegram_chat_id: message.chat.id,
+    first_name: message.from.first_name,
+    username: message.from.username,
+  });
+
+  console.log("User:", user);
+
   try {
     console.log("Message received:", message.text);
 
@@ -237,7 +246,10 @@ bot.on("message", async (message) => {
     // Store the transaction until the user confirms it.
     pendingTransactions.set(
       message.message_id,
-      result.transaction
+      {
+        ...result.transaction,
+        user_id: user.id,
+      }
     );
 
     // Show transaction preview with Confirm / Cancel buttons.
