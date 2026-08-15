@@ -1,27 +1,50 @@
 import { askGroq } from "../ai/groq.service.js";
-import { TransactionSchema } from "../schemas/transaction.schema.js";
+import { MessageSchema } from "../schemas/transaction.schema.js";
 
-// Converts a Telegram message into a validated transaction.
-// Does NOT save to PostgreSQL yet.
-export async function processTransaction(messageText, telegramMessageId) {
-  // 1. Ask Groq to understand the user's message.
+// Turns one raw Telegram message into a validated, structured result.
+//
+// This function deliberately does NOT touch PostgreSQL. It only understands
+// the message; saving happens later, and only after the shopkeeper taps
+// Confirm. Keeping the AI logic and the SQL in separate files means either
+// one can change without breaking the other.
+//
+// Returns one of:
+//   { intent: "transaction", transaction: {...} }   -> needs confirmation
+//   { intent: "balance_query", person: "Raj" }      -> answer immediately
+//   { intent: "history_query", person: "Raj" }      -> answer immediately
+export async function processMessage(messageText, telegramMessageId) {
+  // 1. Ask Groq to understand the shopkeeper's message.
   const aiResponse = await askGroq(messageText);
 
-  // 2. Convert Groq's JSON string into a JavaScript object.
-  const transaction = JSON.parse(aiResponse);
+  // 2. Convert Groq's JSON text into a JavaScript object.
+  //    If Groq returned something that is not JSON this throws, and the
+  //    caller marks the message FAILED.
+  const parsed = JSON.parse(aiResponse);
 
-  // 3. Validate the AI-generated object with Zod.
-  const validatedTransaction = TransactionSchema.parse(transaction);
+  // 3. Validate against the schema. `intent` decides which shape is
+  //    required, so a question is not forced to have an amount and a
+  //    transaction is not allowed to be missing one.
+  const validated = MessageSchema.parse(parsed);
 
-  // 4. Add Telegram's message ID.
-  const transactionWithTelegramId = {
-    ...validatedTransaction,
-    telegram_message_id: telegramMessageId,
-  };
+  // 4. Questions are read-only. Return them as-is so the bot can answer
+  //    straight away without creating anything.
+  if (validated.intent !== "transaction") {
+    return {
+      intent: validated.intent,
+      person: validated.person,
+    };
+  }
 
-  // Return the validated transaction.
-  // PostgreSQL will be called only after user confirmation.
+  // 5. For a real transaction, strip the `intent` field (it was only a
+  //    routing hint, not part of the bookkeeping record) and attach
+  //    Telegram's message id so the row can be traced back to the message.
+  const { intent, ...transactionFields } = validated;
+
   return {
-    transaction: transactionWithTelegramId,
+    intent: "transaction",
+    transaction: {
+      ...transactionFields,
+      telegram_message_id: telegramMessageId,
+    },
   };
 }

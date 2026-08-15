@@ -6,7 +6,11 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "bot": "node src/telegram/bot.js",
+    "test": "node tests/schema.test.js",
+    "test:db": "node tests/udhaar.integration.js",
+    "test:ai": "node tests/ai.test.js"
   },
   "repository": {
     "type": "git",

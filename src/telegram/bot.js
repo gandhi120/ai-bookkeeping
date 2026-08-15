@@ -1,18 +1,22 @@
 import TelegramBot from "node-telegram-bot-api";
 import "dotenv/config";
 
-import { processTransaction } from "../services/transaction.service.js";
+import { processMessage } from "../services/transaction.service.js";
 import { getDailySummary } from "../services/summary.service.js";
+import { isCustomerTransaction } from "../schemas/transaction.schema.js";
 
 import {
   getTransactionsByDate,
-  createTransaction,
   findOrCreateUser,
   createMessage,
   updateMessageStatus,
   updateMessageTransactionData,
   getMessageByTelegramMessageId,
   confirmMessageTransaction,
+  getCustomerByName,
+  getCustomerBalance,
+  getCustomerTransactions,
+  getAllOutstanding,
 } from "../database/postgres.js";
 
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
@@ -29,12 +33,46 @@ const bot = new TelegramBot(token, {
 console.log("Telegram bot is running...");
 
 // --------------------------------------------------
+// Shared helpers
+// --------------------------------------------------
+
+// Resolves the Telegram sender into a shopkeeper row.
+// EVERY handler must call this before reading or writing data, because
+// user.id is what scopes all queries. Without it a handler would read
+// across all shopkeepers.
+async function resolveShopkeeper(from, chat) {
+  return await findOrCreateUser({
+    telegram_user_id: from.id,
+    telegram_chat_id: chat.id,
+    first_name: from.first_name,
+    username: from.username,
+  });
+}
+
+// Formats a number as Indian rupees, e.g. 50000 -> "₹50,000".
+function money(value) {
+  return `₹${Number(value).toLocaleString("en-IN")}`;
+}
+
+// Returns today's date as YYYY-MM-DD in the shop's timezone.
+// "en-CA" is used because that locale formats dates as YYYY-MM-DD,
+// which is exactly what PostgreSQL expects for a ::date cast.
+function today() {
+  return new Date().toLocaleDateString("en-CA", {
+    timeZone: "Asia/Kolkata",
+  });
+}
+
+// --------------------------------------------------
 // /monthly
 // --------------------------------------------------
 
 // Generates and sends the current month's financial summary.
 bot.onText(/^\/monthly$/, async (message) => {
   try {
+    // Scope the summary to this shopkeeper only.
+    const user = await resolveShopkeeper(message.from, message.chat);
+
     const now = new Date();
 
     const year = Number(
@@ -51,7 +89,7 @@ bot.onText(/^\/monthly$/, async (message) => {
       })
     );
 
-    const summary = await getMonthlySummary(year, month);
+    const summary = await getMonthlySummary(user.id, year, month);
 
     const monthName = now.toLocaleDateString("en-IN", {
       month: "long",
@@ -65,10 +103,10 @@ bot.onText(/^\/monthly$/, async (message) => {
 
 ${monthName}
 
-Sales: ₹${summary.totalSales}
-Purchases: ₹${summary.totalPurchases}
-Expenses: ₹${summary.totalExpenses}
-Net Balance: ₹${summary.netBalance}
+Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}
 
 Transactions: ${summary.transactionCount}`
     );
@@ -92,19 +130,30 @@ bot.onText(/^\/start$/, async (message) => {
     message.chat.id,
     `👋 Welcome to your AI Bookkeeping Assistant!
 
-You can simply send me your business transactions in normal language.
+Just send me your shop transactions in normal language.
 
-For example:
+Buying and selling:
 
-"Bought a laptop for ₹50,000"
-"Sold 5 T-shirts for ₹3,000"
-"Paid ₹500 for electricity"
+"Bought 10 kg rice for ₹600"
+"Sold 5 shirts for ₹2,500"
+"Paid electricity bill ₹1,800"
+
+Udhaar (credit):
+
+"Raj took goods for ₹2,000 on udhaar"
+"Raj paid ₹1,000"
+
+Ask me anything:
+
+"How much does Raj owe me?"
+"Show Raj's transactions"
 
 Commands:
 
 /summary - Today's financial summary
 /transactions - Today's transactions
 /monthly - Monthly financial summary
+/udhaar - Who owes you money
 /help - Show available commands`
   );
 });
@@ -119,17 +168,31 @@ bot.onText(/^\/help$/, async (message) => {
     message.chat.id,
     `🤖 Bookkeeping Assistant
 
-You can send transactions naturally:
+Send transactions naturally:
 
-"Bought a laptop for ₹50,000"
-"Sold 5 T-shirts for ₹3,000"
-"Paid ₹500 for electricity"
+"Bought 10 kg rice for ₹600"
+"Sold 5 shirts for ₹2,500"
+"Paid electricity bill ₹1,800"
+"Paid ₹3,000 to supplier"
+
+Udhaar (credit):
+
+"Raj took goods for ₹2,000 on udhaar"
+"Sold goods to Amit for ₹2,500 on credit"
+"Raj paid ₹1,000"
+"Raj cleared his ₹3,000 udhaar"
+
+Ask about a customer:
+
+"How much does Raj owe me?"
+"Show Raj's transactions"
 
 Commands:
 
 /summary - Today's financial summary
 /transactions - Today's transactions
 /monthly - Monthly financial summary
+/udhaar - Who owes you money
 /help - Show this help`
   );
 });
@@ -141,16 +204,17 @@ Commands:
 // Fetches and displays today's transactions for the user.
 bot.onText(/^\/transactions$/, async (message) => {
   try {
-    const today = new Date().toLocaleDateString("en-CA", {
-      timeZone: "Asia/Kolkata",
-    });
+    // Scope the list to this shopkeeper only.
+    const user = await resolveShopkeeper(message.from, message.chat);
 
-    const transactions = await getTransactionsByDate(today);
+    const date = today();
+
+    const transactions = await getTransactionsByDate(user.id, date);
 
     if (transactions.length === 0) {
       await bot.sendMessage(
         message.chat.id,
-        `📋 No transactions found for ${today}.`
+        `📋 No transactions found for ${date}.`
       );
 
       return;
@@ -160,8 +224,10 @@ bot.onText(/^\/transactions$/, async (message) => {
       .map(
         (transaction, index) =>
           `${index + 1}. ${transaction.transaction_type.toUpperCase()}
-${transaction.description} — ₹${transaction.amount}
-Category: ${transaction.category}`
+${transaction.description} — ${money(transaction.amount)}
+Category: ${transaction.category}${
+            transaction.person ? `\nCustomer: ${transaction.person}` : ""
+          }`
       )
       .join("\n\n");
 
@@ -169,7 +235,7 @@ Category: ${transaction.category}`
       message.chat.id,
       `📋 Today's Transactions
 
-Date: ${today}
+Date: ${date}
 
 ${transactionList}`
     );
@@ -190,11 +256,10 @@ ${transactionList}`
 // Generates and sends today's financial summary.
 bot.onText(/^\/summary$/, async (message) => {
   try {
-    const today = new Date().toLocaleDateString("en-CA", {
-      timeZone: "Asia/Kolkata",
-    });
+    // Scope the summary to this shopkeeper only.
+    const user = await resolveShopkeeper(message.from, message.chat);
 
-    const summary = await getDailySummary(today);
+    const summary = await getDailySummary(user.id, today());
 
     await bot.sendMessage(
       message.chat.id,
@@ -202,10 +267,10 @@ bot.onText(/^\/summary$/, async (message) => {
 
 Date: ${summary.date}
 
-Sales: ₹${summary.totalSales}
-Purchases: ₹${summary.totalPurchases}
-Expenses: ₹${summary.totalExpenses}
-Net Balance: ₹${summary.netBalance}
+Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}
 
 Transactions: ${summary.transactionCount}`
     );
@@ -220,6 +285,161 @@ Transactions: ${summary.transactionCount}`
 });
 
 // --------------------------------------------------
+// /udhaar
+// --------------------------------------------------
+
+// Shows every customer who still owes this shopkeeper money.
+bot.onText(/^\/udhaar$/, async (message) => {
+  try {
+    const user = await resolveShopkeeper(message.from, message.chat);
+
+    const customers = await getAllOutstanding(user.id);
+
+    if (customers.length === 0) {
+      await bot.sendMessage(
+        message.chat.id,
+        "📒 No pending udhaar. Everyone has cleared their balance."
+      );
+
+      return;
+    }
+
+    const total = customers.reduce(
+      (sum, customer) => sum + Number(customer.outstanding),
+      0
+    );
+
+    const list = customers
+      .map(
+        (customer, index) =>
+          `${index + 1}. ${customer.name} — ${money(customer.outstanding)}`
+      )
+      .join("\n");
+
+    await bot.sendMessage(
+      message.chat.id,
+      `📒 Udhaar Book
+
+${list}
+
+Total pending: ${money(total)}`
+    );
+  } catch (error) {
+    console.error("Udhaar list error:", error);
+
+    await bot.sendMessage(
+      message.chat.id,
+      "Sorry, I couldn't load the udhaar book."
+    );
+  }
+});
+
+// --------------------------------------------------
+// Customer question helpers
+// --------------------------------------------------
+
+// Answers "How much does Raj owe me?".
+// Read-only: nothing is created, so this never enters the confirmation flow.
+async function answerBalanceQuery(chatId, user, personName) {
+  const customer = await getCustomerByName(user.id, personName);
+
+  // The shopkeeper has no such customer. Say so instead of showing ₹0,
+  // which would look like a cleared balance.
+  if (!customer) {
+    await bot.sendMessage(
+      chatId,
+      `🔍 No customer named "${personName}" in your khata yet.`
+    );
+
+    return;
+  }
+
+  const balance = await getCustomerBalance(user.id, customer.id);
+
+  if (balance === 0) {
+    await bot.sendMessage(
+      chatId,
+      `✅ ${customer.name} has cleared all udhaar. Outstanding: ₹0`
+    );
+
+    return;
+  }
+
+  // A negative balance means the customer paid more than they owed,
+  // so the shopkeeper is holding advance money for them.
+  if (balance < 0) {
+    await bot.sendMessage(
+      chatId,
+      `💰 ${customer.name} has paid ${money(
+        Math.abs(balance)
+      )} in advance (no pending udhaar).`
+    );
+
+    return;
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `📒 ${customer.name} owes you ${money(balance)}.`
+  );
+}
+
+// Answers "Show Raj's transactions" with that customer's udhaar entries.
+async function answerHistoryQuery(chatId, user, personName) {
+  const customer = await getCustomerByName(user.id, personName);
+
+  if (!customer) {
+    await bot.sendMessage(
+      chatId,
+      `🔍 No customer named "${personName}" in your khata yet.`
+    );
+
+    return;
+  }
+
+  const transactions = await getCustomerTransactions(user.id, customer.id);
+
+  if (transactions.length === 0) {
+    await bot.sendMessage(
+      chatId,
+      `📋 No entries yet for ${customer.name}.`
+    );
+
+    return;
+  }
+
+  const balance = await getCustomerBalance(user.id, customer.id);
+
+  const list = transactions
+    .map((transaction) => {
+      // Show the direction of each entry so the running total makes sense.
+      const sign =
+        transaction.transaction_type === "credit_sale" ? "＋" : "－";
+
+      const date = new Date(
+        transaction.transaction_date
+      ).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        timeZone: "Asia/Kolkata",
+      });
+
+      return `${sign} ${money(transaction.amount)}  ${date}
+   ${transaction.description}`;
+    })
+    .join("\n");
+
+  await bot.sendMessage(
+    chatId,
+    `📋 ${customer.name}'s Khata
+
+${list}
+
+Outstanding: ${money(balance)}`
+  );
+}
+
+// --------------------------------------------------
 // Normal transaction messages
 // --------------------------------------------------
 
@@ -229,26 +449,31 @@ bot.on("message", async (message) => {
     return;
   }
 
-  try {
-    // Find or create the application user from Telegram information.
-    const user = await findOrCreateUser({
-      telegram_user_id: message.from.id,
-      telegram_chat_id: message.chat.id,
-      first_name: message.from.first_name,
-      username: message.from.username,
-    });
+  // Declared OUTSIDE the try block on purpose. `const` inside try{} is
+  // block scoped and would be invisible to catch{}, so the FAILED status
+  // could never be written.
+  let savedMessage;
 
-    console.log("User:", user);
+  try {
+    // Find or create the shopkeeper from Telegram information.
+    const user = await resolveShopkeeper(message.from, message.chat);
 
     // Save every incoming Telegram message permanently.
-    const savedMessage = await createMessage({
+    savedMessage = await createMessage({
       user_id: user.id,
       telegram_message_id: message.message_id,
       message_text: message.text,
       status: "RECEIVED",
     });
 
-    console.log("Message saved:", savedMessage);
+    // createMessage uses ON CONFLICT DO NOTHING, so a redelivered Telegram
+    // message returns no row. Fetch the original instead of crashing.
+    if (!savedMessage) {
+      savedMessage = await getMessageByTelegramMessageId(
+        user.id,
+        message.message_id
+      );
+    }
 
     // Mark the message as currently being processed by AI.
     await updateMessageStatus(
@@ -256,19 +481,37 @@ bot.on("message", async (message) => {
       "PROCESSING"
     );
 
-    // Process the message using Groq and validate the result with Zod.
-    const result = await processTransaction(
+    // Ask Groq what this message means and validate the answer with Zod.
+    const result = await processMessage(
       message.text,
       message.message_id
     );
 
-    console.log(
-      "Transaction ready for confirmation:",
-      result
-    );
+    // ----------------------------------------------
+    // Questions are answered immediately.
+    // They create nothing, so they skip confirmation entirely.
+    // ----------------------------------------------
+    if (result.intent === "balance_query") {
+      await answerBalanceQuery(message.chat.id, user, result.person);
+      await updateMessageStatus(savedMessage.id, "ANSWERED");
+
+      return;
+    }
+
+    if (result.intent === "history_query") {
+      await answerHistoryQuery(message.chat.id, user, result.person);
+      await updateMessageStatus(savedMessage.id, "ANSWERED");
+
+      return;
+    }
+
+    // ----------------------------------------------
+    // A real transaction: store it and wait for confirmation.
+    // ----------------------------------------------
 
     // Store the AI-generated transaction data in PostgreSQL.
-    // This replaces the need to keep the transaction in memory.
+    // This is why no in-memory Map is needed: the pending transaction
+    // survives a server restart because PostgreSQL holds it.
     await updateMessageTransactionData(
       savedMessage.id,
       result.transaction
@@ -280,6 +523,33 @@ bot.on("message", async (message) => {
       "PENDING_CONFIRMATION"
     );
 
+    // For udhaar entries, show what the customer owes right now so the
+    // shopkeeper can see the before/after before committing to it.
+    let khataLine = "";
+
+    if (
+      isCustomerTransaction(result.transaction.transaction_type) &&
+      result.transaction.person
+    ) {
+      const customer = await getCustomerByName(
+        user.id,
+        result.transaction.person
+      );
+
+      const current = customer
+        ? await getCustomerBalance(user.id, customer.id)
+        : 0;
+
+      const after =
+        result.transaction.transaction_type === "credit_sale"
+          ? current + Number(result.transaction.amount)
+          : current - Number(result.transaction.amount);
+
+      khataLine = `\nCustomer: ${result.transaction.person}
+Currently owes: ${money(current)}
+After this entry: ${money(after)}`;
+    }
+
     // Show the transaction preview with Confirm / Cancel buttons.
     await bot.sendMessage(
       message.chat.id,
@@ -289,7 +559,7 @@ Type: ${result.transaction.transaction_type}
 Description: ${result.transaction.description}
 Category: ${result.transaction.category}
 Quantity: ${result.transaction.quantity}
-Amount: ₹${result.transaction.amount}
+Amount: ${money(result.transaction.amount)}
 Date: ${new Date(
         result.transaction.transaction_date
       ).toLocaleDateString("en-IN", {
@@ -297,7 +567,7 @@ Date: ${new Date(
         month: "short",
         year: "numeric",
         timeZone: "Asia/Kolkata",
-      })}`,
+      })}${khataLine}`,
       {
         reply_markup: {
           inline_keyboard: [
@@ -322,9 +592,9 @@ Date: ${new Date(
     );
 
     // Mark the message as failed because AI processing failed.
-    // savedMessage is available because it is created before
-    // the AI processing starts.
-    if (typeof savedMessage !== "undefined" && savedMessage) {
+    // savedMessage is visible here because it is declared in the outer
+    // scope above the try block.
+    if (savedMessage) {
       await updateMessageStatus(
         savedMessage.id,
         "FAILED"
@@ -350,13 +620,8 @@ bot.on("callback_query", async (query) => {
 
     const telegramMessageId = Number(messageId);
 
-    // Get the Telegram user who clicked the button.
-    const user = await findOrCreateUser({
-      telegram_user_id: query.from.id,
-      telegram_chat_id: query.message.chat.id,
-      first_name: query.from.first_name,
-      username: query.from.username,
-    });
+    // Get the shopkeeper who clicked the button.
+    const user = await resolveShopkeeper(query.from, query.message.chat);
 
     // Retrieve the original message and its transaction data
     // from PostgreSQL.
@@ -472,13 +737,28 @@ bot.on("callback_query", async (query) => {
           text: "Transaction saved!",
         });
 
+        // For udhaar entries, show the customer's new outstanding balance
+        // so the shopkeeper gets immediate confirmation of the khata.
+        let khataLine = "";
+
+        if (savedTransaction.customer_id) {
+          const balance = await getCustomerBalance(
+            user.id,
+            savedTransaction.customer_id
+          );
+
+          khataLine = `\n\n📒 ${savedTransaction.person} now owes ${money(
+            balance
+          )}`;
+        }
+
         // Replace the confirmation message with the saved result.
         await bot.editMessageText(
           `✅ Transaction saved
 
 Type: ${savedTransaction.transaction_type}
 Description: ${savedTransaction.description}
-Amount: ₹${savedTransaction.amount}`,
+Amount: ${money(savedTransaction.amount)}${khataLine}`,
           {
             chat_id: query.message.chat.id,
             message_id: query.message.message_id,
