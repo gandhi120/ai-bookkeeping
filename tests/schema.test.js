@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import {
   MessageSchema,
   isCustomerTransaction,
+  isTypeAllowedInWorkspace,
   TRANSACTION_TYPES,
 } from "../src/schemas/transaction.schema.js";
 
@@ -141,6 +142,56 @@ check("ordinary types are not customer transactions", () => {
   for (const type of ["sale", "purchase", "expense", "payment_sent", "payment_received", "other"]) {
     assert.equal(isCustomerTransaction(type), false, `${type} should not link a customer`);
   }
+});
+
+console.log("\nA workspace only accepts the types that belong in it:");
+
+check("a household cannot record udhaar", () => {
+  // The whole point of the guard: a hallucinated credit_sale on a grocery
+  // message must never reach confirmMessageTransaction, because that is what
+  // opens a khata.
+  for (const type of ["credit_sale", "repayment", "sale", "purchase", "payment_sent", "payment_received"]) {
+    assert.equal(
+      isTypeAllowedInWorkspace("household", type),
+      false,
+      `${type} should not be recordable at home`
+    );
+  }
+});
+
+check("a shop cannot record household income", () => {
+  // Money into a shop is a sale or a payment_received, never a salary.
+  assert.equal(isTypeAllowedInWorkspace("shopkeeper", "income"), false);
+});
+
+check("household accepts its own types", () => {
+  for (const type of ["expense", "income", "other"]) {
+    assert.equal(isTypeAllowedInWorkspace("household", type), true, type);
+  }
+});
+
+check("shopkeeper still accepts every type it accepted before", () => {
+  for (const type of TRANSACTION_TYPES) {
+    if (type === "income") continue;
+
+    assert.equal(
+      isTypeAllowedInWorkspace("shopkeeper", type),
+      true,
+      `${type} regressed out of the shop ledger`
+    );
+  }
+});
+
+check("an unknown workspace type accepts nothing", () => {
+  // Fail closed: a typo in a workspace type must not silently allow
+  // everything through.
+  assert.equal(isTypeAllowedInWorkspace("bogus", "expense"), false);
+  assert.equal(isTypeAllowedInWorkspace(undefined, "expense"), false);
+});
+
+check("expense is the one type both ledgers share", () => {
+  assert.equal(isTypeAllowedInWorkspace("shopkeeper", "expense"), true);
+  assert.equal(isTypeAllowedInWorkspace("household", "expense"), true);
 });
 
 console.log(

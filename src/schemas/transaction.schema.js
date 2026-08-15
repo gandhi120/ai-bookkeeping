@@ -12,8 +12,61 @@ export const TRANSACTION_TYPES = [
   "payment_sent",
   "credit_sale",
   "repayment",
+  "income",
   "other",
 ];
+
+// The two kinds of ledger a user can keep. `type` on the workspaces table.
+export const WORKSPACE_TYPES = ["shopkeeper", "household"];
+
+// Which types are legal in which ledger.
+//
+// `expense` and `other` are in both: an electricity bill is an expense
+// whether the meter is at the shop or at home. Everything else is exclusive —
+// a household has no customers, so it can never produce credit_sale or
+// repayment, and a shop's income is a sale, not a salary.
+const TYPES_BY_WORKSPACE = {
+  shopkeeper: [
+    "sale",
+    "purchase",
+    "expense",
+    "payment_received",
+    "payment_sent",
+    "credit_sale",
+    "repayment",
+    "other",
+  ],
+  household: ["expense", "income", "other"],
+};
+
+// Categories offered to the household prompt. A plain list, not a table:
+// adding one is a one-line edit and nothing references them by id.
+export const HOUSEHOLD_CATEGORIES = [
+  "groceries",
+  "food",
+  "electricity",
+  "water",
+  "gas",
+  "rent",
+  "transport",
+  "education",
+  "medical",
+  "shopping",
+  "entertainment",
+  "subscriptions",
+  "salary",
+  "other",
+];
+
+// Decides whether a transaction type may be recorded in this workspace.
+//
+// The prompt TELLS the AI which types exist; this is what actually enforces
+// it. Keeping the rule here rather than trusting the prompt is the reason a
+// hallucinated `credit_sale` on a household grocery message cannot open a
+// khata — the AI is instructed, never trusted.
+export function isTypeAllowedInWorkspace(workspaceType, transactionType) {
+  return (TYPES_BY_WORKSPACE[workspaceType] ?? []).includes(transactionType);
+}
 
 // Only these two types belong to a customer khata and move an outstanding
 // balance. Everything else (a supplier payment, an electricity bill) has

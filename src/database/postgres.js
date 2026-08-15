@@ -49,59 +49,161 @@ export async function findOrCreateUser(user) {
 }
 
 
-// Gets all transactions for ONE shopkeeper on a specific date.
-// user_id is required, not optional: without it every shopkeeper would
-// see every other shopkeeper's transactions in /summary and /transactions.
-export async function getTransactionsByDate(userId, date) {
+// --------------------------------------------------
+// Workspaces (which ledger the user is writing to)
+// --------------------------------------------------
+//
+// A workspace is a ledger owned by one user — their shop or their home.
+// It has no login and no members; the user just switches between their own.
+// Every transaction read below is scoped by workspace_id, which is what keeps
+// the grocery bill out of the shop's /summary.
+
+// Lists the user's workspaces, oldest first so the switcher order is stable.
+export async function getWorkspaces(userId) {
   const result = await pool.query(
     `
     SELECT *
-    FROM transactions
+    FROM workspaces
     WHERE user_id = $1
-      AND transaction_date = $2::date
-    ORDER BY created_at DESC;
+    ORDER BY created_at;
     `,
-    [userId, date]
+    [userId]
   );
 
   return result.rows;
 }
 
-// Gets all transactions for ONE shopkeeper in a specific month.
-// Scoped by user_id for the same isolation reason as above.
-export async function getTransactionsByMonth(userId, year, month) {
+// Returns the workspace the user is currently working in, or undefined when
+// they have not chosen one yet (a brand new user, before onboarding).
+export async function getActiveWorkspace(userId) {
+  const result = await pool.query(
+    `
+    SELECT w.*
+    FROM users u
+    JOIN workspaces w ON w.id = u.active_workspace_id
+    WHERE u.id = $1;
+    `,
+    [userId]
+  );
+
+  return result.rows[0];
+}
+
+// Creates a workspace, or returns the existing one of that type.
+//
+// The upsert matters because "+ Add Household" is a Telegram button and
+// buttons get double-tapped. ON CONFLICT on the (user_id, type) unique index
+// means the second tap returns the same workspace instead of creating a
+// second home.
+export async function createWorkspace(userId, name, type) {
+  const result = await pool.query(
+    `
+    INSERT INTO workspaces (user_id, name, type)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (user_id, type)
+    DO UPDATE SET updated_at = NOW()
+    RETURNING *;
+    `,
+    [userId, name, type]
+  );
+
+  return result.rows[0];
+}
+
+// Switches which workspace the user is working in.
+//
+// The subquery is the security check, not a lookup: callback_data comes from
+// the client, so `ws:<some-other-users-uuid>` is a thing someone can send.
+// Requiring the workspace to belong to this user means a forged id updates
+// nothing and returns undefined.
+export async function setActiveWorkspace(userId, workspaceId) {
+  const result = await pool.query(
+    `
+    UPDATE users
+    SET
+      active_workspace_id = $2,
+      updated_at = NOW()
+    WHERE id = $1
+      AND EXISTS (
+        SELECT 1
+        FROM workspaces
+        WHERE id = $2
+          AND user_id = $1
+      )
+    RETURNING *;
+    `,
+    [userId, workspaceId]
+  );
+
+  return result.rows[0];
+}
+
+
+// Gets all transactions for ONE workspace on a specific date.
+//
+// Scoped by workspace_id, not user_id: the same user owns both their shop and
+// their home, so user_id alone would show the household groceries inside the
+// shop's /summary. user_id is kept in the WHERE as well — it is implied by
+// the workspace, but checking both means a wrong id can never cross tenants.
+export async function getTransactionsByDate(userId, workspaceId, date) {
   const result = await pool.query(
     `
     SELECT *
     FROM transactions
     WHERE user_id = $1
-      AND transaction_date >= make_date($2, $3, 1)
-      AND transaction_date < make_date($2, $3, 1) + INTERVAL '1 month'
+      AND workspace_id = $2
+      AND transaction_date = $3::date
+    ORDER BY created_at DESC;
+    `,
+    [userId, workspaceId, date]
+  );
+
+  return result.rows;
+}
+
+// Gets all transactions for ONE workspace in a specific month.
+// Scoped by workspace_id for the same isolation reason as above.
+export async function getTransactionsByMonth(userId, workspaceId, year, month) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM transactions
+    WHERE user_id = $1
+      AND workspace_id = $2
+      AND transaction_date >= make_date($3, $4, 1)
+      AND transaction_date < make_date($3, $4, 1) + INTERVAL '1 month'
     ORDER BY transaction_date DESC, created_at DESC;
     `,
-    [userId, year, month]
+    [userId, workspaceId, year, month]
   );
 
   return result.rows;
 }
 
 // Saves every incoming Telegram message.
+//
+// workspace_id is stamped here, at arrival, and never re-read from the user's
+// current setting afterwards. That is what makes confirmation safe: the user
+// can switch workspaces between typing a message and tapping Confirm, and the
+// transaction still lands in the ledger they typed it into.
 export async function createMessage(message) {
   const result = await pool.query(
     `
     INSERT INTO messages (
       user_id,
+      workspace_id,
       telegram_message_id,
       message_text,
       status
     )
-    VALUES ($1, $2, $3, $4)
+    VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (user_id, telegram_message_id)
     DO NOTHING
     RETURNING *;
     `,
     [
       message.user_id,
+      message.workspace_id,
       message.telegram_message_id,
       message.message_text,
       message.status,
@@ -333,6 +435,7 @@ export async function confirmMessageTransaction(
       SELECT
         id,
         user_id,
+        workspace_id,
         status,
         transaction_data
       FROM messages
@@ -408,6 +511,7 @@ export async function confirmMessageTransaction(
       `
       INSERT INTO transactions (
         user_id,
+        workspace_id,
         transaction_type,
         description,
         category,
@@ -427,16 +531,20 @@ export async function confirmMessageTransaction(
         $5,
         $6,
         $7,
-        $8::date,
-        $9,
+        $8,
+        $9::date,
         $10,
-        $11
+        $11,
+        $12
       )
       ON CONFLICT (user_id, telegram_message_id) DO NOTHING
       RETURNING *;
       `,
       [
         userId,
+        // Taken from the locked MESSAGE row, never from the user's current
+        // active workspace — see the comment on createMessage.
+        message.workspace_id,
         transactionType,
         message.transaction_data.description,
         message.transaction_data.category,

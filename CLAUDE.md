@@ -16,23 +16,41 @@ node src/telegram/bot.js   # runs the actual Telegram bot (polling mode)
 
 Note: `src/server.js` does not import the bot — the Fastify server and the Telegram bot are separate entry points. All real functionality lives behind the bot.
 
-There are no tests and no linter configured.
+```bash
+npm test         # tests/schema.test.js — Zod validator. No DB, no API key, free.
+npm run test:db  # tests/udhaar.integration.js — real Postgres. Needs DATABASE_URL.
+npm run test:ws  # tests/workspace.integration.js — workspace isolation. Needs DATABASE_URL.
+npm run test:ai  # tests/ai.test.js — live AI classification. Needs an API key, costs calls.
+```
+
+No linter is configured. The two integration suites create throwaway users and delete everything they create in a `finally` block; existing data is never touched.
 
 Required env vars (in `.env`, loaded via `dotenv/config`): `GROQ_API_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`.
 
-Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-2.0-flash`.
+Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-3.1-flash-lite`.
 
 ## Architecture
 
 ES modules throughout (`"type": "module"`). Flow for an incoming message:
 
-1. **`src/telegram/bot.js`** — all Telegram handling: slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`), free-text message handler, and the confirm/cancel `callback_query` handler. This is the orchestrator.
-2. **`src/services/transaction.service.js`** — `processTransaction()`: asks Groq, `JSON.parse`s the reply, validates with `TransactionSchema` (Zod), attaches the Telegram message ID. Does not touch the database.
-3. **`src/ai/groq.service.js`** — exports `askAI()`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`llama-3.3-70b-versatile`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt()` — the single extraction prompt both providers share (transaction types, udhaar rules, language handling, date defaulting) — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
+1. **`src/telegram/bot.js`** — all Telegram handling: slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`, `/udhaar`, `/workspace`), free-text message handler, and the `callback_query` handler (confirm/cancel, payment clarification, workspace switching). This is the orchestrator. `resolveShopkeeper()` is the single chokepoint that resolves both the user and their active workspace.
+2. **`src/services/transaction.service.js`** — `processMessage(text, telegramMessageId, workspaceType)`: asks the AI, `JSON.parse`s the reply, validates with `MessageSchema` (Zod), enforces the workspace type guard, attaches the Telegram message ID. Does not touch the database.
+3. **`src/ai/groq.service.js`** — exports `askAI(message, workspaceType)`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`llama-3.3-70b-versatile`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt(workspaceType)` — both providers share it, so they cannot drift — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
 
    Model IDs are pinned deliberately — never use Gemini's `-latest` aliases, which Google repoints without warning, and note that Google *retires* models outright (`gemini-2.0-flash` now 404s).
-4. **`src/database/postgres.js`** — all SQL lives here (pg `Pool`, raw queries). No ORM, no migration files in the repo — the `users`, `messages`, and `transactions` tables are assumed to exist already.
-5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — aggregate totals in JS over rows fetched by date/month.
+4. **`src/database/postgres.js`** — all SQL lives here (pg `Pool`, raw queries). No ORM. Schema changes live in `migrations/` as numbered `.sql` files, wrapped in one `BEGIN`/`COMMIT` with commented rollback at the bottom. They are **never run automatically** — review and apply them by hand. The `users`, `messages` and `transactions` tables predate the repo and have no `CREATE TABLE` on disk.
+5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — `summarize(rows, workspaceType)` lives in the first and is imported by the second, so a new transaction type is only added in one place.
+
+## Workspaces
+
+A user keeps one or more ledgers: a `shopkeeper` workspace, a `household` workspace, or both. `users.active_workspace_id` is the switcher state; `/workspace` shows it.
+
+- **`workspace.type` drives everything downstream** — which system prompt `buildSystemPrompt()` returns, which transaction types `isTypeAllowedInWorkspace()` accepts, and how `/summary` and `/monthly` render.
+- **Two separate prompts, not one with a switch.** The prompt ships with every message, so a combined prompt would make every shop message pay for household rules it can never use. `buildShopkeeperPrompt()` is the original text, unchanged; `buildHouseholdPrompt()` is much shorter because a household has no khata.
+- **Isolation is by `workspace_id`, not `user_id`** — the same person owns both ledgers, so `user_id` alone would show the groceries inside the shop's `/summary`. Every transaction read filters on both.
+- **The workspace is stamped on the message at arrival and read back off the locked row at confirmation**, never from the user's current setting. Otherwise switching workspaces between typing and tapping Confirm would misfile the transaction.
+- **The AI is instructed, never trusted.** The prompt is told which types exist; `isTypeAllowedInWorkspace()` in `src/schemas/transaction.schema.js` is what actually enforces it, so a hallucinated `credit_sale` on a grocery message cannot open a khata.
+- `transactions.workspace_id` is deliberately nullable: rows predating `ebcb1a0` have no `user_id`, so they cannot be backfilled. They are invisible to every query either way — see `migrations/002_workspaces.sql`.
 
 ## Key design points
 
@@ -40,4 +58,4 @@ ES modules throughout (`"type": "module"`). Flow for an incoming message:
 - **Confirmation is atomic and race-safe:** `confirmMessageTransaction()` in `postgres.js` uses `BEGIN` + `SELECT ... FOR UPDATE` to lock the message row, inserts the transaction, and marks the message `CONFIRMED` in one transaction. It returns `{success, reason}` objects (`NOT_FOUND`, `ALREADY_PROCESSED`, `TRANSACTION_DATA_MISSING`) rather than throwing for expected failures.
 - **Idempotency via upserts:** `findOrCreateUser` upserts on `telegram_user_id`; `createMessage` and `createTransaction` use `ON CONFLICT ... DO NOTHING` on `(user_id, telegram_message_id)` / `telegram_message_id`.
 - **All dates/times use the `Asia/Kolkata` timezone** and amounts are displayed in ₹ (INR). Dates are formatted with `toLocaleDateString("en-CA")` to get `YYYY-MM-DD` strings passed to SQL as `::date`.
-- Transaction types recognized by the prompt: `sale | purchase | expense | payment_received | payment_sent | other`. Summaries only aggregate `sale`, `purchase`, and `expense`.
+- Transaction types: a shop uses `sale | purchase | expense | payment_received | payment_sent | credit_sale | repayment | other`; a household uses `expense | income | other`. `expense` is the only one both share.

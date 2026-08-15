@@ -17,6 +17,10 @@ import {
   getCustomerBalance,
   getCustomerTransactions,
   getAllOutstanding,
+  getWorkspaces,
+  getActiveWorkspace,
+  createWorkspace,
+  setActiveWorkspace,
 } from "../database/postgres.js";
 
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
@@ -36,17 +40,58 @@ console.log("Telegram bot is running...");
 // Shared helpers
 // --------------------------------------------------
 
-// Resolves the Telegram sender into a shopkeeper row.
-// EVERY handler must call this before reading or writing data, because
-// user.id is what scopes all queries. Without it a handler would read
-// across all shopkeepers.
+// Resolves the Telegram sender into a user row AND the workspace they are
+// currently working in.
+//
+// EVERY handler must call this before reading or writing data. user.id scopes
+// across users; workspace.id scopes within one user, so their shop ledger and
+// their home ledger stay apart. `workspace` is undefined for a brand new user
+// who has not been through onboarding yet — handlers check for that rather
+// than guessing a default.
 async function resolveShopkeeper(from, chat) {
-  return await findOrCreateUser({
+  const user = await findOrCreateUser({
     telegram_user_id: from.id,
     telegram_chat_id: chat.id,
     first_name: from.first_name,
     username: from.username,
   });
+
+  return { user, workspace: await getActiveWorkspace(user.id) };
+}
+
+// The two ledgers a user can keep, and how they are shown.
+// `name` is only the default at creation — nothing looks a workspace up by it.
+const WORKSPACE_KINDS = {
+  shopkeeper: { icon: "🏪", name: "My Shop", label: "Shop" },
+  household: { icon: "🏠", name: "My Home", label: "Household" },
+};
+
+// "🏪 My Shop" — how a workspace is named everywhere in the UI.
+function workspaceLabel(workspace) {
+  return `${WORKSPACE_KINDS[workspace.type].icon} ${workspace.name}`;
+}
+
+// Sent whenever a handler needs a workspace and the user has none yet.
+// Returning the buttons rather than a bare error means onboarding can start
+// from any command, not just /start.
+async function askToChooseWorkspace(chatId) {
+  await bot.sendMessage(
+    chatId,
+    `👋 What do you want to manage?
+
+🏪 Shop — track your business
+🏠 Household — track your personal/family money
+
+You can add the other one later.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🏪 Shop", callback_data: "addws:shopkeeper" }],
+          [{ text: "🏠 Household", callback_data: "addws:household" }],
+        ],
+      },
+    }
+  );
 }
 
 // Formats a number as Indian rupees, e.g. 50000 -> "₹50,000".
@@ -77,6 +122,60 @@ function needsPaymentClarification(transaction) {
   );
 }
 
+// Handles the two workspace buttons: switching to an existing workspace
+// (`ws:<uuid>`) and creating one during onboarding (`addws:<type>`).
+//
+// Both payloads come from the user's Telegram client, so neither is trusted:
+// `addws` is looked up in WORKSPACE_KINDS, which is the whitelist, and
+// setActiveWorkspace refuses a workspace that is not this user's.
+async function handleWorkspaceAction(query, action, value) {
+  const chatId = query.message.chat.id;
+
+  const { user } = await resolveShopkeeper(query.from, query.message.chat);
+
+  let workspace;
+
+  if (action === "addws") {
+    const kind = WORKSPACE_KINDS[value];
+
+    if (!kind) {
+      await bot.answerCallbackQuery(query.id, { text: "Unknown workspace." });
+
+      return;
+    }
+
+    workspace = await createWorkspace(user.id, kind.name, value);
+    await setActiveWorkspace(user.id, workspace.id);
+  } else {
+    // A forged or stale uuid updates nothing and returns undefined.
+    const updated = await setActiveWorkspace(user.id, value);
+
+    if (!updated) {
+      await bot.answerCallbackQuery(query.id, { text: "Workspace not found." });
+
+      return;
+    }
+
+    workspace = await getActiveWorkspace(user.id);
+  }
+
+  await bot.answerCallbackQuery(query.id, {
+    text: `Switched to ${workspace.name}`,
+  });
+
+  await bot.editMessageText(`✅ Now using ${workspaceLabel(workspace)}`, {
+    chat_id: chatId,
+    message_id: query.message.message_id,
+  });
+
+  await bot.sendMessage(
+    chatId,
+    workspace.type === "household"
+      ? `Send me your household spending, like "Bought groceries for ₹500" or "Salary received ₹65,000".`
+      : `Send me your shop transactions, like "Sold 5 shirts for ₹2,500" or "Raj took goods for ₹2,000 on udhaar".`
+  );
+}
+
 // Maps a clarification button to the transaction type it means.
 // Callback data arrives from the user's Telegram client, so this lookup is
 // the whitelist: anything not listed here can never reach the database.
@@ -92,8 +191,17 @@ const CLARIFIED_TYPE = {
 // Generates and sends the current month's financial summary.
 bot.onText(/^\/monthly$/, async (message) => {
   try {
-    // Scope the summary to this shopkeeper only.
-    const user = await resolveShopkeeper(message.from, message.chat);
+    // Scope the summary to this workspace only.
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
+
+    if (!workspace) {
+      await askToChooseWorkspace(message.chat.id);
+
+      return;
+    }
 
     const now = new Date();
 
@@ -111,7 +219,13 @@ bot.onText(/^\/monthly$/, async (message) => {
       })
     );
 
-    const summary = await getMonthlySummary(user.id, year, month);
+    const summary = await getMonthlySummary(
+      user.id,
+      workspace.id,
+      year,
+      month,
+      workspace.type
+    );
 
     const monthName = now.toLocaleDateString("en-IN", {
       month: "long",
@@ -119,16 +233,32 @@ bot.onText(/^\/monthly$/, async (message) => {
       timeZone: "Asia/Kolkata",
     });
 
+    // A household reports income against expenses and where the money went;
+    // a shop reports sales against purchases. Different questions, so the
+    // dashboard is not one layout with some rows blanked out.
+    const body =
+      workspace.type === "household"
+        ? `Income: ${money(summary.totalIncome)}
+Expenses: ${money(summary.totalExpenses)}
+Balance: ${money(summary.balance)}${
+            summary.byCategory.length > 0
+              ? `\n\nWhere it went:\n${summary.byCategory
+                  .map((row) => `${row.category} — ${money(row.total)}`)
+                  .join("\n")}`
+              : ""
+          }`
+        : `Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}`;
+
     await bot.sendMessage(
       message.chat.id,
-      `📊 Monthly Summary
+      `📊 ${workspaceLabel(workspace)} — Monthly Summary
 
 ${monthName}
 
-Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}
+${body}
 
 Transactions: ${summary.transactionCount}`
     );
@@ -147,10 +277,45 @@ Transactions: ${summary.transactionCount}`
 // --------------------------------------------------
 
 // Sends the welcome message and available commands.
+//
+// A user with no workspace is onboarded instead: they pick a shop or a
+// household and are never forced to create both.
 bot.onText(/^\/start$/, async (message) => {
+  const { workspace } = await resolveShopkeeper(message.from, message.chat);
+
+  if (!workspace) {
+    await askToChooseWorkspace(message.chat.id);
+
+    return;
+  }
+
+  if (workspace.type === "household") {
+    await bot.sendMessage(
+      message.chat.id,
+      `👋 You're in ${workspaceLabel(workspace)}.
+
+Just send me your household spending in normal language.
+
+"Bought groceries for ₹500"
+"Paid electricity bill ₹2,400"
+"Salary received ₹65,000"
+"કિરાણા માટે ₹500 ખર્ચ્યા"
+
+Commands:
+
+/summary - Today's income and spending
+/transactions - Today's entries
+/monthly - This month's dashboard
+/workspace - Switch between shop and home
+/help - Show available commands`
+    );
+
+    return;
+  }
+
   await bot.sendMessage(
     message.chat.id,
-    `👋 Welcome to your AI Bookkeeping Assistant!
+    `👋 You're in ${workspaceLabel(workspace)}.
 
 Just send me your shop transactions in normal language.
 
@@ -176,8 +341,64 @@ Commands:
 /transactions - Today's transactions
 /monthly - Monthly financial summary
 /udhaar - Who owes you money
+/workspace - Switch between shop and home
 /help - Show available commands`
   );
+});
+
+// --------------------------------------------------
+// /workspace
+// --------------------------------------------------
+
+// Shows which ledger is active and offers to switch or create the other one.
+bot.onText(/^\/workspace$/, async (message) => {
+  try {
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
+
+    const workspaces = await getWorkspaces(user.id);
+
+    if (workspaces.length === 0) {
+      await askToChooseWorkspace(message.chat.id);
+
+      return;
+    }
+
+    // One row per existing workspace, ✓ on the active one.
+    const rows = workspaces.map((existing) => [
+      {
+        text: `${workspaceLabel(existing)}${
+          existing.id === workspace?.id ? "  ✓" : ""
+        }`,
+        callback_data: `ws:${existing.id}`,
+      },
+    ]);
+
+    // Then an "+ Add ..." button for whichever kind they don't have yet.
+    for (const [type, kind] of Object.entries(WORKSPACE_KINDS)) {
+      if (!workspaces.some((existing) => existing.type === type)) {
+        rows.push([
+          {
+            text: `+ Add ${kind.label}`,
+            callback_data: `addws:${type}`,
+          },
+        ]);
+      }
+    }
+
+    await bot.sendMessage(message.chat.id, "Current workspace", {
+      reply_markup: { inline_keyboard: rows },
+    });
+  } catch (error) {
+    console.error("Workspace error:", error);
+
+    await bot.sendMessage(
+      message.chat.id,
+      "Sorry, I couldn't load your workspaces."
+    );
+  }
 });
 
 // --------------------------------------------------
@@ -215,7 +436,11 @@ Commands:
 /transactions - Today's transactions
 /monthly - Monthly financial summary
 /udhaar - Who owes you money
-/help - Show this help`
+/workspace - Switch between shop and home
+/help - Show this help
+
+🏠 In your household workspace, send things like
+"Bought groceries for ₹500" or "Salary received ₹65,000".`
   );
 });
 
@@ -226,17 +451,30 @@ Commands:
 // Fetches and displays today's transactions for the user.
 bot.onText(/^\/transactions$/, async (message) => {
   try {
-    // Scope the list to this shopkeeper only.
-    const user = await resolveShopkeeper(message.from, message.chat);
+    // Scope the list to this workspace only.
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
+
+    if (!workspace) {
+      await askToChooseWorkspace(message.chat.id);
+
+      return;
+    }
 
     const date = today();
 
-    const transactions = await getTransactionsByDate(user.id, date);
+    const transactions = await getTransactionsByDate(
+      user.id,
+      workspace.id,
+      date
+    );
 
     if (transactions.length === 0) {
       await bot.sendMessage(
         message.chat.id,
-        `📋 No transactions found for ${date}.`
+        `📋 No transactions found for ${date} in ${workspaceLabel(workspace)}.`
       );
 
       return;
@@ -255,7 +493,7 @@ Category: ${transaction.category}${
 
     await bot.sendMessage(
       message.chat.id,
-      `📋 Today's Transactions
+      `📋 ${workspaceLabel(workspace)} — Today's Transactions
 
 Date: ${date}
 
@@ -278,21 +516,42 @@ ${transactionList}`
 // Generates and sends today's financial summary.
 bot.onText(/^\/summary$/, async (message) => {
   try {
-    // Scope the summary to this shopkeeper only.
-    const user = await resolveShopkeeper(message.from, message.chat);
+    // Scope the summary to this workspace only.
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
 
-    const summary = await getDailySummary(user.id, today());
+    if (!workspace) {
+      await askToChooseWorkspace(message.chat.id);
+
+      return;
+    }
+
+    const summary = await getDailySummary(
+      user.id,
+      workspace.id,
+      today(),
+      workspace.type
+    );
+
+    const body =
+      workspace.type === "household"
+        ? `Income: ${money(summary.totalIncome)}
+Expenses: ${money(summary.totalExpenses)}
+Balance: ${money(summary.balance)}`
+        : `Sales: ${money(summary.totalSales)}
+Purchases: ${money(summary.totalPurchases)}
+Expenses: ${money(summary.totalExpenses)}
+Net Balance: ${money(summary.netBalance)}`;
 
     await bot.sendMessage(
       message.chat.id,
-      `📊 Daily Summary
+      `📊 ${workspaceLabel(workspace)} — Daily Summary
 
 Date: ${summary.date}
 
-Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}
+${body}
 
 Transactions: ${summary.transactionCount}`
     );
@@ -313,7 +572,20 @@ Transactions: ${summary.transactionCount}`
 // Shows every customer who still owes this shopkeeper money.
 bot.onText(/^\/udhaar$/, async (message) => {
   try {
-    const user = await resolveShopkeeper(message.from, message.chat);
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
+
+    // Udhaar is a khata, and only a shop keeps one.
+    if (!workspace || workspace.type !== "shopkeeper") {
+      await bot.sendMessage(
+        message.chat.id,
+        "📒 Udhaar is a shop feature. Switch to your shop with /workspace to see who owes you money."
+      );
+
+      return;
+    }
 
     const customers = await getAllOutstanding(user.id);
 
@@ -544,11 +816,23 @@ bot.on("message", async (message) => {
 
   try {
     // Find or create the shopkeeper from Telegram information.
-    const user = await resolveShopkeeper(message.from, message.chat);
+    const { user, workspace } = await resolveShopkeeper(
+      message.from,
+      message.chat
+    );
+
+    // Without a workspace there is no ledger to write to. Ask before
+    // spending an AI call on a message that has nowhere to go.
+    if (!workspace) {
+      await askToChooseWorkspace(message.chat.id);
+
+      return;
+    }
 
     // Save every incoming Telegram message permanently.
     savedMessage = await createMessage({
       user_id: user.id,
+      workspace_id: workspace.id,
       telegram_message_id: message.message_id,
       message_text: message.text,
       status: "RECEIVED",
@@ -570,10 +854,33 @@ bot.on("message", async (message) => {
     );
 
     // Ask Groq what this message means and validate the answer with Zod.
+    // The workspace type picks which rules the AI is given and which
+    // transaction types are allowed back.
     const result = await processMessage(
       message.text,
-      message.message_id
+      message.message_id,
+      workspace.type
     );
+
+    // The message made sense but does not belong in this ledger — a customer
+    // question asked at home, or a type this workspace cannot record. Say so
+    // plainly instead of failing with a generic apology.
+    if (result.intent === "unsupported") {
+      await bot.sendMessage(
+        message.chat.id,
+        result.reason === "CUSTOMER_QUERY_OUTSIDE_SHOP"
+          ? `That's a customer question, and ${workspaceLabel(
+              workspace
+            )} has no customers. Switch to your shop with /workspace.`
+          : `I couldn't record that in ${workspaceLabel(
+              workspace
+            )}. Try rephrasing, or switch workspace with /workspace.`
+      );
+
+      await updateMessageStatus(savedMessage.id, "ANSWERED");
+
+      return;
+    }
 
     // ----------------------------------------------
     // Questions are answered immediately.
@@ -719,6 +1026,15 @@ bot.on("callback_query", async (query) => {
   try {
     const [action, messageId] = query.data.split(":");
 
+    // Workspace buttons carry a uuid or a workspace type, not a Telegram
+    // message id, so they are handled BEFORE the Number() parse below —
+    // which would otherwise turn them into NaN.
+    if (action === "ws" || action === "addws") {
+      await handleWorkspaceAction(query, action, messageId);
+
+      return;
+    }
+
     const telegramMessageId = Number(messageId);
 
     // Set only when the shopkeeper answered the "what was this money for?"
@@ -726,7 +1042,7 @@ bot.on("callback_query", async (query) => {
     const typeOverride = CLARIFIED_TYPE[action] ?? null;
 
     // Get the shopkeeper who clicked the button.
-    const user = await resolveShopkeeper(query.from, query.message.chat);
+    const { user } = await resolveShopkeeper(query.from, query.message.chat);
 
     // Retrieve the original message and its transaction data
     // from PostgreSQL.

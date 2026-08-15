@@ -16,6 +16,8 @@ import {
   getCustomerTransactions,
   getAllOutstanding,
   getTransactionsByDate,
+  createWorkspace,
+  setActiveWorkspace,
 } from "../src/database/postgres.js";
 
 const A_TG = 999000001;
@@ -36,6 +38,7 @@ function check(name, actual, expected) {
 async function submitAndConfirm(user, msgId, transaction, typeOverride = null) {
   let saved = await createMessage({
     user_id: user.id,
+    workspace_id: SHOP[user.id].id,
     telegram_message_id: msgId,
     message_text: transaction.description,
     status: "RECEIVED",
@@ -61,6 +64,16 @@ function txn(type, person, amount, description) {
 
 const userA = await findOrCreateUser({ telegram_user_id: A_TG, telegram_chat_id: A_TG, first_name: "ShopA", username: "shop_a" });
 const userB = await findOrCreateUser({ telegram_user_id: B_TG, telegram_chat_id: B_TG, first_name: "ShopB", username: "shop_b" });
+
+// Every shopkeeper now writes into a workspace. These tests are all about the
+// shop ledger, so both users get one shop workspace and stay in it —
+// workspace switching is covered in workspace.integration.js.
+const SHOP = {};
+
+for (const u of [userA, userB]) {
+  SHOP[u.id] = await createWorkspace(u.id, "My Shop", "shopkeeper");
+  await setActiveWorkspace(u.id, SHOP[u.id].id);
+}
 
 try {
   console.log("\n--- Test 4: credit sale creates customer + balance ---");
@@ -109,7 +122,7 @@ try {
   check("exactly ONE transaction row created", amitRows, 1);
 
   console.log("\n--- Test 11: cancel creates nothing ---");
-  const cancelMsg = await createMessage({ user_id: userA.id, telegram_message_id: 5006, message_text: "cancel me", status: "RECEIVED" });
+  const cancelMsg = await createMessage({ user_id: userA.id, workspace_id: SHOP[userA.id].id, telegram_message_id: 5006, message_text: "cancel me", status: "RECEIVED" });
   await updateMessageTransactionData(cancelMsg.id, { ...txn("credit_sale", "Vijay", 900, "cancelled"), telegram_message_id: 5006 });
   await updateMessageStatus(cancelMsg.id, "PENDING_CONFIRMATION");
   await updateMessageStatus(cancelMsg.id, "CANCELLED");
@@ -118,7 +131,7 @@ try {
   check("no Vijay customer created", !!(await getCustomerByName(userA.id, "Vijay")), false);
 
   console.log("\n--- ANSWERED status is accepted ---");
-  const qMsg = await createMessage({ user_id: userA.id, telegram_message_id: 5007, message_text: "how much does Raj owe", status: "RECEIVED" });
+  const qMsg = await createMessage({ user_id: userA.id, workspace_id: SHOP[userA.id].id, telegram_message_id: 5007, message_text: "how much does Raj owe", status: "RECEIVED" });
   const answered = await updateMessageStatus(qMsg.id, "ANSWERED");
   check("message marked ANSWERED", answered.status, "ANSWERED");
 
@@ -132,8 +145,8 @@ try {
   check("sorted largest first: Raj 500", [outstanding[0].name, Number(outstanding[0].outstanding)], ["Raj", 500]);
 
   console.log("\n--- Bug B fix: /transactions is user-scoped ---");
-  const aToday = await getTransactionsByDate(userA.id, TODAY);
-  const bToday = await getTransactionsByDate(userB.id, TODAY);
+  const aToday = await getTransactionsByDate(userA.id, SHOP[userA.id].id, TODAY);
+  const bToday = await getTransactionsByDate(userB.id, SHOP[userB.id].id, TODAY);
   check("shop A sees only its own 5 rows", aToday.length, 5);
   check("shop B sees only its own 1 row", bToday.length, 1);
   check("no row of B leaks into A", aToday.every(r => r.user_id === userA.id), true);
@@ -192,6 +205,10 @@ try {
     await pool.query("DELETE FROM transactions WHERE user_id=$1", [u.id]);
     await pool.query("DELETE FROM messages WHERE user_id=$1", [u.id]);
     await pool.query("DELETE FROM customers WHERE user_id=$1", [u.id]);
+    // users.active_workspace_id points AT workspaces, so it has to let go
+    // before the workspace row can be deleted.
+    await pool.query("UPDATE users SET active_workspace_id=NULL WHERE id=$1", [u.id]);
+    await pool.query("DELETE FROM workspaces WHERE user_id=$1", [u.id]);
     await pool.query("DELETE FROM users WHERE id=$1", [u.id]);
   }
   const left = (await pool.query(
@@ -199,7 +216,7 @@ try {
   )).rows[0].c;
   console.log(`  test users remaining: ${left} (should be 0)`);
   const total = (await pool.query("SELECT COUNT(*)::int c FROM transactions")).rows[0].c;
-  console.log(`  transactions table back to: ${total} rows (was 19)`);
+  console.log(`  transactions table back to: ${total} rows`);
   await pool.end();
 }
 
