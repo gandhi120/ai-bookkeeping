@@ -3,9 +3,15 @@ import Groq from "groq-sdk";
 
 import { HOUSEHOLD_CATEGORIES } from "../schemas/transaction.schema.js";
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+// Built on first use, not at import. The SDK throws from its constructor when
+// the key is missing, and imports run before any code in the entry point — so
+// constructing here made a missing key surface as an SDK stack trace before
+// the boot check in bot.js could report the whole list of missing variables.
+let groq;
+
+function client() {
+  return (groq ??= new Groq({ apiKey: process.env.GROQ_API_KEY }));
+}
 
 // Today's date in the user's timezone, used as the default when a message
 // mentions no date. Shared by both prompts so they cannot disagree about
@@ -185,7 +191,7 @@ function stripCodeFences(text) {
 
 // PRIMARY provider.
 async function askGroq(message, workspaceType) {
-  const response = await groq.chat.completions.create({
+  const response = await client().chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
       { role: "system", content: buildSystemPrompt(workspaceType) },

@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node src/telegram/bot.js",
+    "dev": "node --watch src/telegram/bot.js",
     "bot": "node src/telegram/bot.js",
-    "test": "node tests/schema.test.js && node tests/summary.test.js",
+    "test": "node tests/schema.test.js && node tests/summary.test.js && node tests/ratelimit.test.js",
     "test:db": "node tests/udhaar.integration.js",
     "test:ws": "node tests/workspace.integration.js",
     "test:onb": "node tests/onboarding.integration.js",

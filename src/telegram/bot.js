@@ -1,4 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
+import { pathToFileURL } from "node:url";
 import "dotenv/config";
 
 import { processMessage } from "../services/transaction.service.js";
@@ -26,20 +27,59 @@ import {
   setActiveWorkspace,
   countOnboardingTransactions,
   finishOnboarding,
+  pool,
 } from "../database/postgres.js";
 
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
 
+// True only when this file is the process entry point. Importing it — from a
+// test, or from server.js if HTTP is ever added back — then defines the
+// handlers and helpers without connecting to Telegram. Nothing below reaches
+// the network until `start()` runs at the bottom.
+const isEntryPoint =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
-// Creates a Telegram bot instance.
-// polling: true means our Node.js app continuously checks Telegram
-// for new messages.
-const bot = new TelegramBot(token, {
-  polling: true,
-});
+// WEBHOOK_URL is the public https origin this bot is reachable at
+// (e.g. https://ai-bookkeeping.up.railway.app). Setting it is what picks the
+// transport: present means webhook, absent means polling. Production sets it,
+// a laptop does not, so local development keeps working with no extra tooling.
+const webhookUrl = process.env.WEBHOOK_URL;
 
-console.log("Telegram bot is running...");
+// The URL path carries the bot token, which is what authenticates Telegram to
+// us: the library answers 401 to any request whose path does not contain it.
+// This is Telegram's own recommendation — the token is unguessable, and the
+// path is only ever seen by Telegram over TLS.
+const webhookPath = `/bot${token}`;
+
+// Creates a Telegram bot instance.
+//
+// polling: our Node.js app continuously asks Telegram for new messages.
+// Needs no public URL, so it works from a laptop, but it needs a process that
+// stays alive and only one may run per bot token.
+//
+// webHook: Telegram POSTs each update to us instead. The library runs its own
+// plain-HTTP server — the host (Railway/Render/Fly) terminates TLS in front of
+// it — and calls the same handlers below. PORT is injected by the host.
+//
+// Neither transport is started here — `autoOpen: false` and `polling: false`
+// keep the constructor off the network, so importing this file is free. The
+// bottom of the file starts whichever one is configured.
+export const bot = new TelegramBot(
+  token,
+  webhookUrl
+    ? {
+        webHook: {
+          port: Number(process.env.PORT) || 8443,
+          // Answers 200 without a token, so the host's health check passes.
+          healthEndpoint: "/healthz",
+          autoOpen: false,
+        },
+      }
+    : { polling: false }
+);
 
 // --------------------------------------------------
 // Shared helpers
@@ -1135,6 +1175,44 @@ ${khataLine}
 // Normal transaction messages
 // --------------------------------------------------
 
+// --------------------------------------------------
+// Flood guard
+// --------------------------------------------------
+
+// The AI budget is shared across every user and resets daily, so one person
+// pasting a hundred lines does not cost them anything — it takes the whole
+// shop down until tomorrow. This limit protects the other users, which is why
+// it sits in front of the AI call rather than in front of the database.
+const RATE_LIMIT = 20;
+const RATE_WINDOW_MS = 60_000;
+
+const rateCounters = new Map();
+
+// Returns 0 while the sender is within the limit, otherwise how many messages
+// past it this one is. The caller replies only on 1 — the message that crosses
+// — so a flood earns one warning instead of a hundred. `now` is a parameter so
+// the window can be tested without waiting a real minute.
+export function overRateLimit(telegramUserId, now = Date.now()) {
+  const entry = rateCounters.get(telegramUserId);
+
+  if (!entry || now - entry.start > RATE_WINDOW_MS) {
+    // ponytail: unbounded Map, one entry per user ever seen. Dropped wholesale
+    // past 10k — the worst case is that 10k people get a fresh window at the
+    // same moment. Swap for a TTL cache if that ever churns for real.
+    if (rateCounters.size > 10_000) {
+      rateCounters.clear();
+    }
+
+    rateCounters.set(telegramUserId, { start: now, count: 1 });
+
+    return 0;
+  }
+
+  entry.count += 1;
+
+  return entry.count > RATE_LIMIT ? entry.count - RATE_LIMIT : 0;
+}
+
 bot.on("message", async (message) => {
   // Stickers, photos, voice notes and locations have no `text` at all. Without
   // this they fall straight past the command check below (`undefined?.` is
@@ -1146,6 +1224,21 @@ bot.on("message", async (message) => {
 
   // Ignore Telegram commands.
   if (message.text.startsWith("/")) {
+    return;
+  }
+
+  // Below the commands on purpose: only free text reaches the AI, and the AI
+  // is the budget being protected. Commands are pure database reads.
+  const over = overRateLimit(message.from.id);
+
+  if (over) {
+    if (over === 1) {
+      await bot.sendMessage(
+        message.chat.id,
+        "That's a lot at once — give me a minute to catch up, then carry on."
+      );
+    }
+
     return;
   }
 
@@ -1622,7 +1715,7 @@ Want to see what else I can do?`
 });
 
 // --------------------------------------------------
-// Telegram polling errors
+// Telegram transport errors
 // --------------------------------------------------
 
 // Handles errors reported by Telegram polling.
@@ -1632,3 +1725,89 @@ bot.on("polling_error", (error) => {
     error.message
   );
 });
+
+// Same, for the webhook transport. Without a listener the library prints the
+// raw error itself, so this exists to keep the log format consistent.
+bot.on("webhook_error", (error) => {
+  console.error(
+    "Telegram webhook error:",
+    error.message
+  );
+});
+
+// --------------------------------------------------
+// Shutdown
+// --------------------------------------------------
+
+// Every redeploy sends SIGTERM and kills the process shortly after. Stopping
+// the transport first means no new update is accepted while we are on the way
+// out, and `pool.end()` waits for in-flight queries — so a confirmation that
+// is mid-`BEGIN` finishes instead of being cut off and rolled back.
+async function shutdown(signal) {
+  console.log(`${signal} received, shutting down...`);
+
+  try {
+    if (webhookUrl) {
+      await bot.closeWebHook();
+    } else {
+      await bot.stopPolling();
+    }
+
+    await pool.end();
+  } catch (error) {
+    console.error("Shutdown error:", error.message);
+  }
+
+  process.exit(0);
+}
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => shutdown(signal));
+}
+
+// --------------------------------------------------
+// Boot
+// --------------------------------------------------
+
+// Everything above only defines things. This is the only code that touches the
+// network, and it runs solely when this file is the entry point.
+async function start() {
+  // Checked before anything connects. A missing variable otherwise surfaces as
+  // a confusing error on the first real message — the bot boots, looks
+  // healthy, and fails per user. A typo'd name in a host's dashboard is the
+  // most common bad deploy, so it should stop the process, not degrade it.
+  const missingEnv = [
+    "TELEGRAM_BOT_TOKEN",
+    "DATABASE_URL",
+    "GROQ_API_KEY",
+  ].filter((name) => !process.env[name]);
+
+  if (missingEnv.length) {
+    console.error(
+      `Missing required environment variables: ${missingEnv.join(", ")}`
+    );
+
+    process.exit(1);
+  }
+
+  if (webhookUrl) {
+    await bot.openWebHook();
+
+    // Tells Telegram where to deliver updates. Safe to repeat on every boot —
+    // it overwrites the previous registration rather than erroring, so
+    // redeploying on a new URL needs no manual step. Deliberately not wrapped
+    // in a try: a bot Telegram cannot reach should crash visibly rather than
+    // sit there answering health checks.
+    await bot.setWebhook(`${webhookUrl}${webhookPath}`);
+
+    console.log(`Telegram bot listening for webhooks on ${webhookUrl}`);
+  } else {
+    await bot.startPolling();
+
+    console.log("Telegram bot is running (polling)...");
+  }
+}
+
+if (isEntryPoint) {
+  await start();
+}

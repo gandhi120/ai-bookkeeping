@@ -6,18 +6,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Telegram bot that turns natural-language messages ("Bought a laptop for ₹50,000") into bookkeeping transactions. Groq (llama-3.3-70b-versatile) extracts structured JSON from the message, Zod validates it, the user confirms via inline Telegram buttons, and the confirmed transaction is stored in PostgreSQL.
 
+`ARCHITECTURE.md` is the long-form version of this file: every table, every relationship, the reasoning behind each design decision, with worked examples and annotated code. This file stays short; that one teaches.
+
+`FUTURE_FEATURES.md` is the roadmap from bookkeeping to business intelligence — product catalog → inventory → analytics → AI insights — with what each layer needs and why the order cannot be changed.
+
 ## Commands
 
 ```bash
-npm start        # runs src/server.js (Fastify health endpoint on port 3000 — NOT the bot)
+npm start        # runs the bot (src/telegram/bot.js) — the only entry point
 npm run dev      # same, with --watch
-node src/telegram/bot.js   # runs the actual Telegram bot (polling mode)
 ```
 
-Note: `src/server.js` does not import the bot — the Fastify server and the Telegram bot are separate entry points. All real functionality lives behind the bot.
+`src/server.js` (Fastify) and the `fastify` dependency are dead since the bot
+grew its own webhook server — nothing imports either.
 
 ```bash
-npm test         # tests/schema.test.js — Zod validator. No DB, no API key, free.
+npm test         # schema + summary + ratelimit. No DB, no API key, free.
 npm run test:db  # tests/udhaar.integration.js — real Postgres. Needs DATABASE_URL.
 npm run test:ws  # tests/workspace.integration.js — workspace isolation. Needs DATABASE_URL.
 npm run test:onb # tests/onboarding.integration.js — onboarding + practice-data cleanup. Needs DATABASE_URL.
@@ -29,6 +33,54 @@ No linter is configured. The two integration suites create throwaway users and d
 Required env vars (in `.env`, loaded via `dotenv/config`): `GROQ_API_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`.
 
 Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-3.1-flash-lite`.
+
+## Transport: polling vs webhook
+
+`WEBHOOK_URL` is the switch, and it is the *only* switch. Set to the public
+https origin (`https://app.up.railway.app`) the bot runs its own webhook
+server; unset it polls. Production sets it, a laptop does not, so local
+development needs no ngrok and no code change.
+
+- **The bot token in the URL path is the authentication.** The library answers
+  `401` to any request whose path does not contain the token, which is
+  Telegram's own recommended scheme — the token is unguessable and the path is
+  only ever seen by Telegram over TLS. No separate secret to manage.
+- **`/healthz` answers 200 without the token** so the host's health check
+  passes without being handed a credential.
+- **The webhook server speaks plain HTTP.** Railway/Render/Fly terminate TLS in
+  front of it. Passing `key`/`cert` would make it serve HTTPS itself, which is
+  only needed on a bare VPS.
+- **`PORT` is injected by the host**; 8443 is the fallback.
+- **`setWebhook()` runs on every boot** and overwrites the previous
+  registration, so redeploying on a new URL needs no manual step. If it fails
+  the process exits — a bot Telegram cannot reach should crashloop visibly, not
+  sit there looking healthy.
+## Running in production
+
+- **Importing `bot.js` does nothing.** The constructor is passed
+  `polling: false` / `autoOpen: false`, and `start()` at the bottom runs only
+  when `import.meta.url` matches `process.argv[1]`. That is what lets
+  `tests/ratelimit.test.js` import the module without the bot going live, and
+  it is the hook `server.js` would use if HTTP ever comes back for WhatsApp.
+- **`start()` checks the env vars first and exits 1 on any missing.** The list
+  is reported in full, so one restart names every typo rather than one per
+  redeploy. This only works because nothing constructs a client at import time
+  — `groq.service.js` builds its SDK client lazily for exactly this reason,
+  since ESM imports run before any line of the entry point.
+- **SIGTERM stops the transport, then `pool.end()`.** Every redeploy sends it.
+  Closing the transport first means no new update is accepted on the way out,
+  and `pool.end()` waits for in-flight queries — so a Confirm tapped during a
+  deploy commits instead of being severed mid-`BEGIN`. Data is safe either way;
+  this is about the user not seeing a spurious failure.
+- **The flood guard sits in front of the AI, not the database.** `overRateLimit`
+  in `bot.js` allows 20 free-text messages per user per minute. The budget it
+  protects is shared and daily, so one person pasting a hundred lines does not
+  inconvenience themselves — it takes the shop down until tomorrow. Commands
+  skip it because they are pure reads. It replies only on the message that
+  crosses, so a flood earns one warning, not a hundred.
+- **One transport per token, still.** A webhook registered in production
+  silently starves a laptop's `getUpdates`. Use a second BotFather token for
+  local work — the same one-instance rule polling always had.
 
 ## Architecture
 
