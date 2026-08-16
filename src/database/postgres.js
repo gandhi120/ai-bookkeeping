@@ -2,6 +2,7 @@ import pg from "pg";
 import "dotenv/config";
 
 import { isCustomerTransaction } from "../schemas/transaction.schema.js";
+import { isLanguage } from "../i18n/index.js";
 
 const { Pool } = pg;
 
@@ -133,6 +134,34 @@ export async function setActiveWorkspace(userId, workspaceId) {
     RETURNING *;
     `,
     [userId, workspaceId]
+  );
+
+  return result.rows[0];
+}
+
+// Sets the language the bot speaks to this user.
+//
+// NULL in this column means "has not chosen yet", which is what puts the
+// picker in front of a new user before anything else. Once set it is only
+// ever changed by /language or the picker, never inferred.
+//
+// isLanguage() is the whitelist. The column has a CHECK constraint too, but
+// that would surface as a thrown error mid-callback; refusing here means a
+// forged `lang:xx` from a patched Telegram client is a no-op that returns
+// undefined, exactly like a forged workspace uuid above.
+export async function setUserLanguage(userId, language) {
+  if (!isLanguage(language)) return undefined;
+
+  const result = await pool.query(
+    `
+    UPDATE users
+    SET
+      language = $2,
+      updated_at = NOW()
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [userId, language]
   );
 
   return result.rows[0];
@@ -484,35 +513,93 @@ export async function confirmMessageTransaction(
       };
     }
 
-    // The shopkeeper's clarification wins over what the AI stored. Resolved
-    // here, inside the transaction, so the type, the customer link and the
-    // row are all decided together or not at all.
-    const transactionType =
-      typeOverride ?? message.transaction_data.transaction_type;
+    // One message can record several entries — "400 nu dudh, 300 no sabu" is
+    // two. Older rows hold a bare object, so normalize; `[x].flat()` accepts
+    // either and keeps messages saved before this feature confirmable.
+    const entries = [message.transaction_data].flat();
 
-    // For udhaar transactions (credit_sale / repayment), resolve the
-    // customer BEFORE inserting, using the same client so the customer
-    // creation is part of this same atomic transaction. Normal purchases,
-    // sales and expenses have no customer and keep customerId as null.
-    let customerId = null;
+    if (entries.length === 0) {
+      await client.query("ROLLBACK");
 
-    if (
-      isCustomerTransaction(transactionType) &&
-      message.transaction_data.person
-    ) {
-      const customer = await findOrCreateCustomer(
-        client,
-        userId,
-        message.transaction_data.person
-      );
-
-      customerId = customer.id;
+      return {
+        success: false,
+        reason: "TRANSACTION_DATA_MISSING",
+      };
     }
 
-    // Create the final transaction using the same database client.
-    // ON CONFLICT makes this idempotent: if the same Telegram message was
-    // already turned into a transaction, do not create a duplicate.
-    const transactionResult = await client.query(
+    // For udhaar entries (credit_sale / repayment), the customer is resolved
+    // BEFORE inserting, on the same client, so the customer and the row are
+    // created together or not at all. Everything else keeps customer_id null.
+    //
+    // Sequential rather than concurrent on purpose: they share one client, and
+    // two entries naming the same new customer must not race to create it.
+    const rows = [];
+
+    for (const [index, entry] of entries.entries()) {
+      // The shopkeeper's clarification wins over what the AI stored. For a
+      // single-entry message the override applies to it; for several, the bot
+      // has already written each answer back into the stored data, so the
+      // override is only ever used when there is exactly one entry.
+      const transactionType =
+        (entries.length === 1 ? typeOverride : null) ?? entry.transaction_type;
+
+      let customerId = null;
+
+      if (isCustomerTransaction(transactionType) && entry.person) {
+        const customer = await findOrCreateCustomer(client, userId, entry.person);
+
+        customerId = customer.id;
+      }
+
+      rows.push({
+        entry,
+        transactionType,
+        customerId,
+        // Position within the message. Stored so the widened unique
+        // constraint can tell entry 2 from entry 1 while still refusing a
+        // second copy of either.
+        seq: entry.seq ?? index,
+      });
+    }
+
+    // One statement, N rows, inside the transaction that is already open —
+    // so a failure on entry 3 leaves entries 1 and 2 unwritten too. That is
+    // what the single Confirm button promises.
+    //
+    // ON CONFLICT keys on seq as well, which is what makes it idempotent per
+    // entry rather than per message: a re-confirm is still a no-op, but entry
+    // 2 no longer collides with entry 1. See migrations/005_multi_transaction.
+    const values = rows
+      .map((_, index) => {
+        const at = index * 13;
+
+        return `($${at + 1}, $${at + 2}, $${at + 3}, $${at + 4}, $${at + 5}, $${
+          at + 6
+        }, $${at + 7}, $${at + 8}, $${at + 9}::date, $${at + 10}, $${at + 11}, $${
+          at + 12
+        }, $${at + 13})`;
+      })
+      .join(",\n        ");
+
+    const params = rows.flatMap(({ entry, transactionType, customerId, seq }) => [
+      userId,
+      // Taken from the locked MESSAGE row, never from the user's current
+      // active workspace — see the comment on createMessage.
+      message.workspace_id,
+      transactionType,
+      entry.description,
+      entry.category,
+      entry.quantity,
+      entry.amount,
+      entry.person,
+      entry.transaction_date,
+      entry.notes,
+      entry.telegram_message_id,
+      customerId,
+      seq,
+    ]);
+
+    await client.query(
       `
       INSERT INTO transactions (
         user_id,
@@ -526,61 +613,29 @@ export async function confirmMessageTransaction(
         transaction_date,
         notes,
         telegram_message_id,
-        customer_id
+        customer_id,
+        seq
       )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        $4,
-        $5,
-        $6,
-        $7,
-        $8,
-        $9::date,
-        $10,
-        $11,
-        $12
-      )
-      ON CONFLICT (user_id, telegram_message_id) DO NOTHING
-      RETURNING *;
+      VALUES
+        ${values}
+      ON CONFLICT (user_id, telegram_message_id, seq) DO NOTHING;
       `,
-      [
-        userId,
-        // Taken from the locked MESSAGE row, never from the user's current
-        // active workspace — see the comment on createMessage.
-        message.workspace_id,
-        transactionType,
-        message.transaction_data.description,
-        message.transaction_data.category,
-        message.transaction_data.quantity,
-        message.transaction_data.amount,
-        message.transaction_data.person,
-        message.transaction_data.transaction_date,
-        message.transaction_data.notes,
-        message.transaction_data.telegram_message_id,
-        customerId,
-      ]
+      params
     );
 
-    // DO NOTHING returns no row when the transaction already existed.
-    // That is not an error: it means an earlier attempt already saved it,
-    // so fetch the existing row and continue to mark the message CONFIRMED.
-    let transaction = transactionResult.rows[0];
-
-    if (!transaction) {
-      const existing = await client.query(
-        `
-        SELECT *
-        FROM transactions
-        WHERE user_id = $1
-          AND telegram_message_id = $2;
-        `,
-        [userId, message.transaction_data.telegram_message_id]
-      );
-
-      transaction = existing.rows[0];
-    }
+    // Read the rows back rather than using RETURNING, because DO NOTHING
+    // returns nothing for an entry an earlier attempt already saved. Selecting
+    // gives the same answer whether this call wrote the rows or found them.
+    const saved = await client.query(
+      `
+      SELECT *
+      FROM transactions
+      WHERE user_id = $1
+        AND telegram_message_id = $2
+      ORDER BY seq;
+      `,
+      [userId, entries[0].telegram_message_id]
+    );
 
     // Mark the original message as confirmed.
     await client.query(
@@ -599,7 +654,7 @@ export async function confirmMessageTransaction(
 
     return {
       success: true,
-      transaction,
+      transactions: saved.rows,
     };
   } catch (error) {
     // Something failed, so undo everything in this transaction.
@@ -619,9 +674,10 @@ export async function confirmMessageTransaction(
 // Finds the practice transactions belonging to a user.
 //
 // A transaction carries no onboarding flag of its own: it is reached through
-// the message that produced it. Both tables have a UNIQUE (user_id,
-// telegram_message_id), so this join matches at most one transaction per
-// message.
+// the message that produced it. Since 005 one message can produce SEVERAL
+// transactions, so this join fans out — which is correct for both users of
+// it, because the count and the delete fan out identically: a practice
+// message with three entries is counted as three and deletes three.
 //
 // The ::text cast is load bearing. messages.telegram_message_id is bigint
 // while transactions.telegram_message_id is text — a mismatch that predates

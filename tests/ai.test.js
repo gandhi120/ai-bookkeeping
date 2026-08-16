@@ -85,6 +85,21 @@ const CASES = [
   // The guard in transaction.service.js turns it into `unsupported` rather
   // than letting it through as a query.
   { workspace: "household", text: "How much does Raj owe me?", intent: "unsupported" },
+
+  // SEVERAL ENTRIES IN ONE MESSAGE.
+  //
+  // The first of these is verbatim what Varun typed on his first real test.
+  // The AI understood both halves and returned an array; everything below the
+  // AI then threw it away. `entries` is the assertion that matters here — the
+  // type/amount checks only look at the first one.
+  { workspace: "household", text: "400 nu dudh lavya, 300 no kpda dhova no sabu lavya", intent: "transaction", entries: 2, type: "expense", amount: 400 },
+  { workspace: "household", text: "500 નું કરિયાણું લીધું અને 200 નું શાક લીધું", intent: "transaction", entries: 2, type: "expense", amount: 500 },
+  { workspace: "household", text: "दूध 60, सब्ज़ी 140, बिजली का बिल 2400", intent: "transaction", entries: 3 },
+  { text: "10 kg rice 600 lidha ane 5 shirt 2500 ma vechya", intent: "transaction", entries: 2 },
+
+  // One entry must still come back as one — asking for a list must not make
+  // the model split a single sentence into pieces.
+  { workspace: "household", text: "Bought groceries for ₹500", intent: "transaction", entries: 1, type: "expense", amount: 500 },
 ];
 
 // Pre-flight: check the CASES table against itself before spending a single
@@ -135,14 +150,19 @@ for (const [index, testCase] of CASES.entries()) {
     continue;
   }
 
+  // One message can now record several entries. Every case below states one
+  // expectation, so the first entry is the one compared — a case that means
+  // to check multiple entries should assert on `result.transactions.length`
+  // via the `entries` field instead.
   const actual =
     result.intent === "transaction"
       ? {
           intent: result.intent,
-          type: result.transaction.transaction_type,
-          amount: result.transaction.amount,
-          person: result.transaction.person,
-          category: result.transaction.category,
+          type: result.transactions[0].transaction_type,
+          amount: result.transactions[0].amount,
+          person: result.transactions[0].person,
+          category: result.transactions[0].category,
+          entries: result.transactions.length,
         }
       : { intent: result.intent, person: result.person };
 
@@ -163,6 +183,9 @@ for (const [index, testCase] of CASES.entries()) {
   }
   if (testCase.person !== undefined && actual.person !== testCase.person) {
     problems.push(`person ${JSON.stringify(actual.person)} != ${JSON.stringify(testCase.person)}`);
+  }
+  if (testCase.entries !== undefined && actual.entries !== testCase.entries) {
+    problems.push(`entries ${actual.entries} != ${testCase.entries}`);
   }
 
   if (problems.length === 0) {

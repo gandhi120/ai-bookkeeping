@@ -2,6 +2,7 @@ import "dotenv/config";
 import Groq from "groq-sdk";
 
 import { HOUSEHOLD_CATEGORIES } from "../schemas/transaction.schema.js";
+import { LANGUAGES } from "../i18n/index.js";
 
 // Built on first use, not at import. The SDK throws from its constructor when
 // the key is missing, and imports run before any code in the entry point — so
@@ -28,10 +29,25 @@ function today() {
 // and vice versa. Splitting them also means the shopkeeper text below is
 // untouched by this feature — the udhaar rules cannot regress if nothing
 // edits them.
-function buildSystemPrompt(workspaceType) {
-  return workspaceType === "household"
-    ? buildHouseholdPrompt()
-    : buildShopkeeperPrompt();
+// `language` is the user's chosen language, and it changes exactly one thing:
+// which language the model writes "description" in. Everything else about the
+// prompt is unaffected — the LANGUAGE sections below already accept Gujarati,
+// Hinglish or English INPUT in any mix, and "person" and "category" stay in
+// English letters regardless, which is what keeps the customer lookup
+// matching a name typed two different ways.
+//
+// English adds no line at all rather than "write in English": the prompt is
+// sent with every single message, so the token budget is the binding
+// production limit and existing users must pay nothing for this feature.
+function buildSystemPrompt(workspaceType, language = "en") {
+  const base =
+    workspaceType === "household"
+      ? buildHouseholdPrompt()
+      : buildShopkeeperPrompt();
+
+  const aiName = LANGUAGES[language]?.aiName;
+
+  return aiName ? `${base}\nWrite "description" in ${aiName}.\n` : base;
 }
 
 // The system prompt is sent with EVERY message, so its length is a running
@@ -52,12 +68,15 @@ shopkeeper; any named person ("Raj") is their customer, never the sender.
 Never copy a transaction_type into "intent". Anything being RECORDED, however
 short, is intent "transaction".
 
+ALWAYS return a JSON LIST, even for one thing. One object per distinct entry:
+a message with three purchases returns three objects.
+
 ASKING about a customer:
-{"intent": "balance_query" | "history_query", "person": "Name"}
+[{"intent": "balance_query" | "history_query", "person": "Name"}]
 balance_query = how much is owed. history_query = show their entries.
 
 RECORDING anything else:
-{
+[{
   "intent": "transaction",
   "transaction_type": "sale|purchase|expense|payment_received|payment_sent|credit_sale|repayment|other",
   "description": "string",
@@ -67,7 +86,7 @@ RECORDING anything else:
   "person": "string or null",
   "transaction_date": "YYYY-MM-DD",
   "notes": "string or null"
-}
+}]
 
 TYPES
 purchase          bought goods/stock
@@ -135,12 +154,15 @@ function buildHouseholdPrompt() {
 Personal/family finance assistant. The sender is tracking their OWN household
 money. There are no customers and no credit here.
 
+ALWAYS return a JSON LIST, even for one thing. One object per distinct entry:
+a message with three expenses returns three objects.
+
 If the message ASKS what somebody owes, or asks to see somebody's entries,
-return {"intent": "balance_query", "person": "Name"} and nothing else. The app
-explains that this needs the shop — do not invent an intent of your own.
+return [{"intent": "balance_query", "person": "Name"}] and nothing else. The
+app explains that this needs the shop — do not invent an intent of your own.
 
 Return ONLY JSON:
-{
+[{
   "intent": "transaction",
   "transaction_type": "expense|income|other",
   "description": "string",
@@ -150,7 +172,7 @@ Return ONLY JSON:
   "person": "string or null",
   "transaction_date": "YYYY-MM-DD",
   "notes": "string or null"
-}
+}]
 
 TYPES
 expense  money out: groceries, bills, rent, fuel, medicine, shopping, fees
@@ -190,11 +212,11 @@ function stripCodeFences(text) {
 }
 
 // PRIMARY provider.
-async function askGroq(message, workspaceType) {
+async function askGroq(message, workspaceType, language) {
   const response = await client().chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      { role: "system", content: buildSystemPrompt(workspaceType) },
+      { role: "system", content: buildSystemPrompt(workspaceType, language) },
       { role: "user", content: message },
     ],
     temperature: 0,
@@ -206,7 +228,7 @@ async function askGroq(message, workspaceType) {
 // FALLBACK provider, used when Groq fails — most often because the free
 // tier's 100k tokens/day is exhausted. Plain REST with the built-in fetch:
 // this is one HTTP POST, so a Google SDK would be more code than the request.
-async function askGemini(message, workspaceType) {
+async function askGemini(message, workspaceType, language) {
   // `||` not `??`: an unset key in .env reads as "" rather than undefined,
   // and "" would build a URL with no model name in it.
   //
@@ -228,7 +250,9 @@ async function askGemini(message, workspaceType) {
       body: JSON.stringify({
         // Gemini keeps instructions separate from the user's message — the
         // same split as Groq's system/user roles.
-        system_instruction: { parts: [{ text: buildSystemPrompt(workspaceType) }] },
+        system_instruction: {
+          parts: [{ text: buildSystemPrompt(workspaceType, language) }],
+        },
         contents: [{ role: "user", parts: [{ text: message }] }],
         generationConfig: {
           temperature: 0,
@@ -272,21 +296,22 @@ async function askGemini(message, workspaceType) {
 // Without GEMINI_API_KEY this calls Groq directly and behaves exactly as it
 // did before the fallback existed.
 //
-// `workspaceType` decides which rules the model gets. It defaults to
-// "shopkeeper" so any caller that has not been updated keeps behaving exactly
-// as it does today.
-export async function askAI(message, workspaceType = "shopkeeper") {
+// `workspaceType` decides which rules the model gets, and `language` decides
+// which language the description comes back in. Both default to what the bot
+// did before they existed, so any caller that has not been updated — and both
+// providers on the fallback path — keep behaving exactly as they do today.
+export async function askAI(message, workspaceType = "shopkeeper", language = "en") {
   if (!process.env.GEMINI_API_KEY) {
-    return await askGroq(message, workspaceType);
+    return await askGroq(message, workspaceType, language);
   }
 
   try {
-    return await askGemini(message, workspaceType);
+    return await askGemini(message, workspaceType, language);
   } catch (geminiError) {
     console.warn("Gemini failed, falling back to Groq:", geminiError.message);
 
     try {
-      return await askGroq(message, workspaceType);
+      return await askGroq(message, workspaceType, language);
     } catch (groqError) {
       // Surface both, otherwise a Gemini key typo looks like a Groq outage.
       throw new Error(

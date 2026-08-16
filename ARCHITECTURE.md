@@ -138,6 +138,7 @@ which ledger anything goes into. Section 8 covers why.
          ▼
    ┌───────────────────────────────────────────────────────┐
    │  src/telegram/bot.js          the orchestrator        │
+   │  - is it text, not a command?  is the sender flooding?│
    │  - who is this user?  which workspace are they in?    │
    └───────────────────────────────────────────────────────┘
          │
@@ -192,26 +193,41 @@ You type `"Raj took goods for ₹2,000 on udhaar"`. Here is every hop:
 
 | # | Where | Function | What it returns |
 |---|---|---|---|
-| 1 | `bot.js:1138` | `bot.on("message")` fires | — |
-| 2 | `bot.js:96` | `resolveShopkeeper(from, chat)` | `{ user, workspace }` |
-| 3 | `postgres.js:189` | `createMessage(...)` | the `messages` row, status `RECEIVED` |
-| 4 | `postgres.js:222` | `updateMessageStatus(id, "PROCESSING")` | updated row |
-| 5 | `transaction.service.js:23` | `processMessage(text, msgId, "shopkeeper")` | calls the AI ↓ |
-| 6 | `groq.service.js:272` | `askAI(message, "shopkeeper")` | raw JSON **text** |
-| 7 | `transaction.service.js:35-40` | `JSON.parse` → `MessageSchema.parse` | validated object |
-| 8 | `postgres.js:239` | `updateMessageTransactionData(...)` | data stored as JSONB |
-| 9 | `postgres.js:222` | `updateMessageStatus(id, "PENDING_CONFIRMATION")` | updated row |
-| 10 | `bot.js:1322` | `bot.sendMessage(...)` with buttons | preview shown |
+| 1 | `bot.js:1216` | `bot.on("message")` fires | — |
+| 2 | `bot.js:1221`, `bot.js:1226` | is there `text`? does it start with `/`? | returns early if either |
+| 3 | `bot.js:1195` | `overRateLimit(from.id)` | `0` while under the limit |
+| 4 | `bot.js:96` | `resolveShopkeeper(from, chat)` | `{ user, workspace }` |
+| 5 | `bot.js:1263` | `if (!workspace)` — the ledger gate | asks the question, returns |
+| 6 | `postgres.js:189` | `createMessage(...)` | the `messages` row, status `RECEIVED` |
+| 7 | `postgres.js:222` | `updateMessageStatus(id, "PROCESSING")` | updated row |
+| 8 | `transaction.service.js:23` | `processMessage(text, msgId, "shopkeeper")` | calls the AI ↓ |
+| 9 | `groq.service.js:278` | `askAI(message, "shopkeeper")` | raw JSON **text** |
+| 10 | `transaction.service.js:35-40` | `JSON.parse` → `MessageSchema.parse` | validated object |
+| 11 | `postgres.js:239` | `updateMessageTransactionData(...)` | data stored as JSONB |
+| 12 | `postgres.js:222` | `updateMessageStatus(id, "PENDING_CONFIRMATION")` | updated row |
+| 13 | `bot.js:1413` | `bot.sendMessage(...)` with buttons | preview shown |
+
+**Steps 2, 3 and 5 all come before the AI call**, and that ordering is the
+point: a sticker, a command, a flood, or a user with no ledger costs zero API
+budget. Section 15 covers the flood guard, section 11.7 the gate.
+
+**Three branches leave this path before step 11** and never produce a preview:
+a question (`balance_query` / `history_query`) is answered immediately and the
+message goes `ANSWERED`; an `unsupported` result says why and also goes
+`ANSWERED`; and an ambiguous payment (section 10) reaches step 12 but gets the
+clarification buttons at `bot.js:1117` instead of Confirm / Cancel.
 
 **…then it stops and waits.** Possibly for hours. Possibly across a server
 restart. When the user finally taps Confirm:
 
 | # | Where | Function | What it returns |
 |---|---|---|---|
-| 11 | `bot.js:1392` | `bot.on("callback_query")` fires | — |
-| 12 | `postgres.js:262` | `getMessageByTelegramMessageId(...)` | the pending message row |
-| 13 | `postgres.js:425` | `confirmMessageTransaction(...)` | `{ success: true, transaction }` |
-| 14 | `bot.js:1577` | `bot.editMessageText(...)` | preview replaced with the result |
+| 14 | `bot.js:1485` | `bot.on("callback_query")` fires | — |
+| 15 | `bot.js:96` | `resolveShopkeeper(from, chat)` | `{ user, workspace }` |
+| 16 | `postgres.js:262` | `getMessageByTelegramMessageId(...)` | the pending message row |
+| 17 | `bot.js:1538` | status is still `PENDING_CONFIRMATION`? | else a toast, and stop |
+| 18 | `postgres.js:425` | `confirmMessageTransaction(...)` | `{ success: true, transaction }` |
+| 19 | `bot.js:1670` | `bot.editMessageText(...)` | preview replaced with the result |
 
 ### The one rule that shapes all of it
 
@@ -360,11 +376,11 @@ It is only a `text` column, but it decides four separate things downstream:
 
 | What it decides | Where |
 |---|---|
-| Which system prompt the AI receives | `groq.service.js:25` `buildSystemPrompt()` |
+| Which system prompt the AI receives | `groq.service.js:31` `buildSystemPrompt()` |
 | Which transaction types are legal | `transaction.schema.js:91` `isTypeAllowedInWorkspace()` |
 | Which features the ledger offers | `transaction.schema.js:62` `featuresForWorkspace()` |
 | How `/summary` and `/monthly` render | `summary.service.js:14` `summarize()` |
-| Whether `/udhaar` works at all | `bot.js:887` |
+| Whether `/udhaar` works at all | `bot.js:927` |
 
 Three lists in `transaction.schema.js` are keyed by it — what a ledger can
 **record** (`TYPES_BY_WORKSPACE`), what it can **do** (`FEATURES_BY_WORKSPACE`,
@@ -878,7 +894,7 @@ second lock. One user seeing another user's numbers is not a bug, it is a
 **data breach**. Two conditions where one would do is a very cheap insurance
 premium.
 
-From `postgres.js:143`:
+From `postgres.js:144`:
 
 ```
 // Scoped by workspace_id, not user_id: the same user owns both their shop and
@@ -925,8 +941,9 @@ workspace".
 
 `workspace` is `undefined` for a brand new user who has not picked a ledger
 yet, and every handler checks for it explicitly rather than guessing a default
-(`bot.js:518`, `bot.js:613`, `bot.js:698`, `bot.js:833`, `bot.js:858`,
-`bot.js:1170`).
+(`bot.js:558`, `bot.js:653`, `bot.js:738`, `bot.js:833`, `bot.js:898`,
+`bot.js:986`, `bot.js:1263`). `/workspace` is the eighth gate: it asks the same
+question when the user has no workspaces at all (`bot.js:682`).
 
 ### The test that guards it
 
@@ -996,15 +1013,15 @@ Follow one message, `"Raj took goods for ₹2,000 on udhaar"`:
 | Step | Code | `messages.status` | `transaction_data` |
 |---|---|---|---|
 | 1. Message arrives | `bot.js:1274` `createMessage` | `RECEIVED` | `null` |
-| 2. About to call the AI | `bot.js:1202` | `PROCESSING` | `null` |
+| 2. About to call the AI | `bot.js:1295` | `PROCESSING` | `null` |
 | 3. AI answered, Zod passed | `bot.js:1361` | `PROCESSING` | `{…}` written |
-| 4. Preview sent | `bot.js:1274` | `PENDING_CONFIRMATION` | `{…}` |
+| 4. Preview sent | `bot.js:1413` | `PENDING_CONFIRMATION` | `{…}` |
 | 5. ⏸ waiting for a tap | — | `PENDING_CONFIRMATION` | `{…}` |
 | 6. Confirm tapped | `postgres.js:586` | `CONFIRMED` | `{…}` (kept) |
 
 Alternative endings: `CANCELLED` (user tapped Cancel), `FAILED` (AI error or
-bad JSON — `bot.js:1364`), `ANSWERED` (it was a question, nothing to confirm —
-`bot.js:1238`).
+bad JSON — `bot.js:1457`), `ANSWERED` (it was a question, nothing to confirm —
+`bot.js:1342`).
 
 `transaction_data` is deliberately **not** cleared on confirm. It is the record
 of what the AI proposed, which is what you want when someone reports that a
@@ -1076,7 +1093,7 @@ if (!message.transaction_data) {
 *expected* outcomes, not exceptional ones — a user double-tapping is normal
 behaviour, not an error condition. Exceptions are for the unexpected; a result
 object is for outcomes you anticipated. The caller reads `result.reason` and
-picks a message (`bot.js:1518-1475`).
+picks a message (`bot.js:1611-1636`).
 
 ```js
 const transactionType = typeOverride ?? message.transaction_data.transaction_type;
@@ -1392,7 +1409,7 @@ the scarce daily budget is held in reserve.
 **Why both errors are surfaced:** if only the Groq error propagated, a typo in
 the Gemini API key would look like a Groq outage. Debugging that is miserable.
 
-**Why one shared prompt** (`groq.service.js:25`):
+**Why one shared prompt** (`groq.service.js:31`):
 
 ```js
 function buildSystemPrompt(workspaceType) {
@@ -1409,13 +1426,13 @@ provider happened to answer*. That is a bug you would never reproduce reliably.
 ### 8.3 Two prompts, not one with a switch
 
 `buildShopkeeperPrompt()` (3,450 chars ≈ 863 tokens) and
-`buildHouseholdPrompt()` (1,598 chars ≈ 400 tokens) are separate functions.
+`buildHouseholdPrompt()` (1,780 chars ≈ 445 tokens) are separate functions.
 
 Why not one prompt with a section for each? **Because the system prompt is sent
 with every single message.** It is a per-message cost, forever. A combined
 prompt would make every shop message pay for household rules it can never use.
 
-The household prompt is 54% smaller because a home has no khata — no udhaar, no
+The household prompt is 48% smaller because a home has no khata — no udhaar, no
 customers, and therefore none of the "is this money-in a repayment or not"
 reasoning that costs most of the shopkeeper prompt's tokens.
 
@@ -1536,7 +1553,7 @@ if (!isTypeAllowedInWorkspace(workspaceType, validated.transaction_type)) {
 `isTypeAllowedInWorkspace("household", "credit_sale")` → `["expense","income",
 "other"].includes("credit_sale")` → **`false`**. ❌ **Rejected here.**
 
-**What the user sees** (`bot.js:1232`):
+**What the user sees** (`bot.js:1319`):
 
 ```
 I couldn't record that in 🏠 My Home. Try rephrasing, or switch workspace
@@ -1574,7 +1591,7 @@ That's a customer question, and 🏠 My Home has no customers. Switch to your
 shop with /workspace.
 ```
 
-There is a lesson buried in the household prompt here (`groq.service.js:132`):
+There is a lesson buried in the household prompt here (`groq.service.js:138`):
 
 ```
 If the message ASKS what somebody owes, or asks to see somebody's entries,
@@ -1683,7 +1700,7 @@ The `SUM(CASE …)` after entry 4: `+2000 +1500 −1000 −3000 = −500`.
 balance is not a bug — it means the shopkeeper is holding ₹500 of Raj's money.
 
 But `"Raj owes you ₹-500"` reads as nonsense to a shopkeeper, so it is phrased
-as what it actually is (`bot.js:996`):
+as what it actually is (`bot.js:1036`):
 
 ```js
 if (balance < 0) {
@@ -1707,7 +1724,7 @@ And zero gets its own branch, because `₹0` alone is ambiguous — it could mea
 ```
 
 A customer who does not exist at all gets a *different* message again
-(`bot.js:977`):
+(`bot.js:1015`):
 
 ```
 🔍 No customer named "Raj" in your khata yet.
@@ -1857,7 +1874,7 @@ weeks later, if ever.
 
 ### 10.2 The prompt refuses to guess
 
-The shopkeeper prompt is explicit (`groq.service.js:77`):
+The shopkeeper prompt is explicit (`groq.service.js:83`):
 
 ```
 MONEY IN - repayment vs payment_received. NEVER GUESS: this changes what a
@@ -1897,7 +1914,7 @@ someone, purpose unstated" case. `payment_received` with `person: null`
 ("Received ₹5,000 cash") is unambiguous — nobody's khata can be affected.
 
 Instead of the normal Confirm/Cancel preview, the user gets a question
-(`bot.js:1077`):
+(`bot.js:1117`):
 
 ```
 📝 Please confirm
@@ -1929,14 +1946,14 @@ Raj has no udhaar recorded yet.
 
 ### 10.4 The answer travels as a type override
 
-The buttons carry a different action word (`bot.js:1114`):
+The buttons carry a different action word (`bot.js:1154`):
 
 ```js
 { text: "📒 Udhaar Repayment", callback_data: `repayment:${telegramMessageId}` },
 { text: "💰 Normal Payment",   callback_data: `income:${telegramMessageId}` },
 ```
 
-which is translated through a whitelist (`bot.js:434`):
+which is translated through a whitelist (`bot.js:474`):
 
 ```js
 // Maps a clarification button to the transaction type it means.
@@ -1961,8 +1978,8 @@ An object lookup can only ever return one of two known values, or `undefined`.
 Unknown key → `undefined` → `?? null` → no override → the AI's original type
 stands. **Not a crash, not an error — just no effect.**
 
-This is the same shape as the `WORKSPACE_KINDS` check (`bot.js:213`) and the
-`ONBOARDING_STEPS` array (`bot.js:342`). Three places where user-supplied
+This is the same shape as the `WORKSPACE_KINDS` check (`bot.js:253`) and the
+`ONBOARDING_STEPS` array (`bot.js:382`). Three places where user-supplied
 strings arrive, three whitelists. *Never let external input choose a code path
 by being that path's name.*
 
@@ -2056,7 +2073,10 @@ Bot    🎉 That's the whole app — type it, tap Confirm.
 
 You    (taps 📒 Who owes me)
 
-Bot    📒 No pending udhaar. Everyone has cleared their balance.
+Bot    📒 Nobody owes you money right now.
+
+       When you record something like "Raj took goods for ₹2,000 on udhaar",
+       Raj will appear here until he pays it back.
 Bot    What else?
 
        [ 📊 Today's summary ] … [ ✅ Finish setup ]
@@ -2111,7 +2131,7 @@ that could get out of sync with what is on screen.
 ### 11.3 Why the flag is on `messages`, not `transactions`
 
 `is_onboarding` marks a **message** as practice data, stamped at arrival
-(`bot.js:1189`):
+(`bot.js:1274`):
 
 ```js
 savedMessage = await createMessage({
@@ -2283,7 +2303,7 @@ should deny.
 button. The rule lives in the schema next to the other workspace rules, not in
 the UI.
 
-Then in `bot.js:282`, one table pairs each feature's label with the function
+Then in `bot.js:322`, one table pairs each feature's label with the function
 that runs it:
 
 ```js
@@ -2300,7 +2320,7 @@ a feature have a button with no handler — which sends Telegram a button
 captioned `undefined` — or a handler no button reaches. Pairing them in one
 entry makes both halves impossible to forget.
 
-The buttons are then built by intersecting the two (`bot.js:295`):
+The buttons are then built by intersecting the two (`bot.js:336`):
 
 ```js
 const featureRows = featuresForWorkspace(workspace.type).map((feature) => [
@@ -2309,7 +2329,7 @@ const featureRows = featuresForWorkspace(workspace.type).map((feature) => [
 ```
 
 And the whitelist from section 10.4 is **derived** rather than retyped
-(`bot.js:342`):
+(`bot.js:382`):
 
 ```js
 const ONBOARDING_STEPS = [...Object.keys(TOUR), "finish", "clear", "keep"];
@@ -2328,7 +2348,7 @@ action" branch — it falls past the `onb` check into the transaction path, wher
 `Number("summary")` is `NaN` and the user gets a baffling "Transaction not
 found." Deriving the whitelist from `TOUR` makes the mismatch unrepresentable.
 
-**Why the tour comes after the first save, not before.** From `bot.js:265`:
+**Why the tour comes after the first save, not before.** From `bot.js:305`:
 
 ```
 // This is the moment the user has seen the whole loop work, so the tour is
@@ -2341,10 +2361,25 @@ found." Deriving the whitelist from `TOUR` makes the mismatch unrepresentable.
 And every tour button re-offers the card afterwards (`"What else?"`), so trying
 a second feature is one tap rather than a hunt.
 
+Running the real commands means their **empty states** are part of onboarding
+too. `/udhaar` with nobody owing says how a khata is created rather than only
+that there isn't one (`bot.js:943`):
+
+```
+📒 Nobody owes you money right now.
+
+When you record something like "Raj took goods for ₹2,000 on udhaar", Raj will
+appear here until he pays it back.
+```
+
+"Everyone has cleared their balance" — the obvious wording — reads as a mistake
+to a shopkeeper who has never lent to anybody, which is exactly who taps this
+button during the tour.
+
 #### The skip button
 
 The practice prompt carries `⏭ Skip setup`, pointing at `onb:finish`
-(`bot.js:153`) — **the same step the Finish button uses.**
+(`bot.js:204`) — **the same step the Finish button uses.**
 
 Skipping is therefore not a separate path with its own rules. It ends
 onboarding through the identical code, and still offers to clear anything
@@ -2376,17 +2411,17 @@ button.
 
 Two more details:
 
-- **Zero entries skips the question entirely** (`bot.js:391`). Asking "shall I
+- **Zero entries skips the question entirely** (`bot.js:431`). Asking "shall I
   delete 0 rows?" is noise.
 - **`finish` and `clear` are separate taps.** Deleting data always takes a
   deliberate second confirmation.
 
 ### 11.7 The gate is unskippable because it is everywhere
 
-`askToChooseWorkspace()` is called from **ten** places — every command handler
+`askToChooseWorkspace()` is called from **eight** places — every command handler
 and the free-text handler. Not just `/start`.
 
-The reason is in the comment (`bot.js:92`):
+The reason is in the comment (`bot.js:119`):
 
 ```
 // No workspace means no ledger, so nothing else in the bot can run: every
@@ -2399,8 +2434,19 @@ The reason is in the comment (`bot.js:92`):
 **Most people never type `/start`.** They say "hii". Designing onboarding to
 begin at `/start` means designing it for users who do not exist.
 
+They also say 👋 with a sticker, and a sticker update has no `text` at all. The
+message handler returns early on that (`bot.js:1221`) — without the guard,
+`undefined` reaches `createMessage`, whose `message_text` column is NOT NULL,
+and a first contact ends in a crash:
+
+```js
+if (!message.text) {
+  return;
+}
+```
+
 And a beginner who types "hii" mid-tutorial does not get an apology about a
-transaction they never tried to record (`bot.js:1373`):
+transaction they never tried to record (`bot.js:1466`):
 
 ```js
 if (onboardingWorkspace) {
@@ -2418,15 +2464,15 @@ escape hatch, so somebody who never types anything is not trapped.
 
 | Command | Handler | Does the work | Tables read |
 |---|---|---|---|
-| `/start` | `bot.js:607` | `sendWelcomeHelp` (`bot.js:582`) | `users`, `workspaces` |
-| `/help` | `bot.js:692` | inline | `users`, `workspaces` |
-| `/workspace` | `bot.js:633` | `getWorkspaces`, `setActiveWorkspace` | `workspaces`, `users` |
-| `/summary` | `bot.js:850` | `sendDailySummary` (`bot.js:859`) | `transactions` |
-| `/transactions` | `bot.js:785` | `sendTransactionsList` (`bot.js:789`) | `transactions` |
-| `/monthly` | `bot.js:510` | `sendMonthlySummary` (`bot.js:447`) | `transactions` |
-| `/udhaar` | `bot.js:936` | `sendUdhaarList` (`bot.js:885`) | `customers` ⋈ `transactions` |
-| *free text* | `bot.js:1138` | `processMessage` → `askAI` → Zod | writes `messages` |
-| *button tap* | `bot.js:1392` | `confirmMessageTransaction` | `messages`, `transactions`, `customers` |
+| `/start` | `bot.js:647` | `sendWelcomeHelp` (`bot.js:582`) | `users`, `workspaces` |
+| `/help` | `bot.js:732` | inline | `users`, `workspaces` |
+| `/workspace` | `bot.js:673` | `getWorkspaces`, `setActiveWorkspace` | `workspaces`, `users` |
+| `/summary` | `bot.js:890` | `sendDailySummary` (`bot.js:859`) | `transactions` |
+| `/transactions` | `bot.js:825` | `sendTransactionsList` (`bot.js:789`) | `transactions` |
+| `/monthly` | `bot.js:550` | `sendMonthlySummary` (`bot.js:487`) | `transactions` |
+| `/udhaar` | `bot.js:976` | `sendUdhaarList` (`bot.js:925`) | `customers` ⋈ `transactions` |
+| *free text* | `bot.js:1216` | `processMessage` → `askAI` → Zod | writes `messages` |
+| *button tap* | `bot.js:1485` | `confirmMessageTransaction` | `messages`, `transactions`, `customers` |
 
 Every one of them starts with `resolveShopkeeper()` and every one checks
 `if (!workspace)` before touching data.
@@ -2476,7 +2522,7 @@ Balance: ₹61,600
 Transactions: 4
 ```
 
-The branch (`bot.js:827`):
+The branch (`bot.js:867`):
 
 ```js
 const body =
@@ -2993,7 +3039,7 @@ entry points, and the prediction here was that webhooks would force them to
 meet.
 
 That is what happened — but the bot grew **its own** webhook server instead
-(`bot.js:54`), so `npm start` now runs the bot and nothing imports `server.js`
+(`bot.js:49`), so `npm start` now runs the bot and nothing imports `server.js`
 or `fastify` at all.
 
 ```js
@@ -3060,7 +3106,7 @@ when the module is the process entry point. So `bot.js` is importable, and
 anything it exports is testable — which `tests/ratelimit.test.js` does for
 `overRateLimit()` with no database and no API key.
 
-**What is still untested:** the ~1,700 lines of handlers. They need a fake `bot`
+**What is still untested:** the ~1,800 lines of handlers. They need a fake `bot`
 object to drive, which is a bigger job. What is covered now is the logic that
 guards money — and `overRateLimit` is squarely that:
 
@@ -3204,8 +3250,8 @@ second one is the one you would forget.
 
 ### Step 4 — the display
 
-`src/telegram/bot.js`, in `sendDailySummary` (`bot.js:827`) and the `/monthly`
-handler (`bot.js:481`), in the shopkeeper branch only:
+`src/telegram/bot.js`, in `sendDailySummary` (`bot.js:867`) and the `/monthly`
+handler (`bot.js:521`), in the shopkeeper branch only:
 
 ```js
 : `Sales: ${money(summary.totalSales)}
@@ -3278,7 +3324,7 @@ make it impossible.**
 - **Read next:** `src/database/postgres.js` — every query in the system, all in
   one file, all commented.
 - **Then:** `src/telegram/bot.js` — the orchestrator. Start at
-  `bot.on("message")` (`bot.js:1138`) and follow it down.
+  `bot.on("message")` (`bot.js:1216`) and follow it down.
 - **Change something small:** add a category to `HOUSEHOLD_CATEGORIES` and watch
   it appear in the prompt with no other edit.
 - **Before any schema change:** read the three files in `migrations/` — they are

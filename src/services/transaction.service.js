@@ -15,70 +15,132 @@ import {
 // which transaction types are legal. It defaults to "shopkeeper" so an
 // un-updated caller behaves exactly as before workspaces existed.
 //
+// `language` is passed straight through to the AI, which uses it for one
+// thing only: the language "description" comes back in. Nothing here reads
+// it, and no validation depends on it — a Gujarati description is still just
+// a string.
+//
+// How many entries one message may record.
+//
+// A shopkeeper closing up types the day in one go, so several entries is the
+// normal case, not an edge case. The cap is there for a pasted wall of text:
+// past this the card stops being readable and one tap would write too much to
+// check. The overflow is reported, never silently dropped.
+export const MAX_ENTRIES = 10;
+
 // Returns one of:
-//   { intent: "transaction", transaction: {...} }   -> needs confirmation
+//   { intent: "transaction", transactions: [...], skipped: {...} }
 //   { intent: "balance_query", person: "Raj" }      -> answer immediately
 //   { intent: "history_query", person: "Raj" }      -> answer immediately
 //   { intent: "unsupported", reason: "..." }        -> tell the user politely
 export async function processMessage(
   messageText,
   telegramMessageId,
-  workspaceType = "shopkeeper"
+  workspaceType = "shopkeeper",
+  language = "en"
 ) {
   // 1. Ask the AI to understand the shopkeeper's message. Groq answers
   //    normally; Gemini takes over automatically if Groq is unavailable.
-  const aiResponse = await askAI(messageText, workspaceType);
+  const aiResponse = await askAI(messageText, workspaceType, language);
 
-  // 2. Convert Groq's JSON text into a JavaScript object.
-  //    If Groq returned something that is not JSON this throws, and the
-  //    caller marks the message FAILED.
+  // 2. Convert the JSON text into JavaScript. If it is not JSON this throws,
+  //    and the caller marks the message FAILED.
   const parsed = JSON.parse(aiResponse);
 
-  // 3. Validate against the schema. `intent` decides which shape is
-  //    required, so a question is not forced to have an amount and a
-  //    transaction is not allowed to be missing one.
-  const validated = MessageSchema.parse(parsed);
+  // 3. Normalize to a list. Both prompts ask for one, but a model that
+  //    answers a one-entry message with a bare object must not be a failure —
+  //    `[x].flat()` accepts either shape and costs nothing.
+  const entries = [parsed].flat();
 
-  // 4. Questions are read-only. Return them as-is so the bot can answer
-  //    straight away without creating anything.
-  if (validated.intent !== "transaction") {
+  // 4. A question is never mixed with entries in practice, so the first query
+  //    intent in the list decides: this message is a question, answer it and
+  //    record nothing.
+  const query = entries.find(
+    (entry) => entry?.intent === "balance_query" || entry?.intent === "history_query"
+  );
+
+  if (query) {
     // Only a shop has customers, so only a shop can be asked about a khata.
     // The household prompt is told never to produce these, but the prompt is
     // an instruction and this is the rule.
     if (workspaceType !== "shopkeeper") {
-      return {
-        intent: "unsupported",
-        reason: "CUSTOMER_QUERY_OUTSIDE_SHOP",
-      };
+      return { intent: "unsupported", reason: "CUSTOMER_QUERY_OUTSIDE_SHOP" };
     }
 
-    return {
-      intent: validated.intent,
-      person: validated.person,
-    };
+    const validated = MessageSchema.parse(query);
+
+    return { intent: validated.intent, person: validated.person };
   }
 
-  // 4b. The workspace, not the AI, decides which types may be recorded. This
-  //     is what stops a hallucinated credit_sale on a household grocery
-  //     message from opening a khata.
-  if (!isTypeAllowedInWorkspace(workspaceType, validated.transaction_type)) {
-    return {
-      intent: "unsupported",
-      reason: "TYPE_NOT_IN_WORKSPACE",
-      transactionType: validated.transaction_type,
-    };
-  }
+  // 5. Validate each entry ON ITS OWN.
+  //
+  //    Parsing the whole list at once would mean one unusable line throws
+  //    away every good line beside it — which is how "400 nu dudh, 300 no
+  //    sabu" could lose both to a single missing amount. Each entry stands or
+  //    falls by itself, and what was dropped is reported back so the user is
+  //    told rather than left to notice.
+  const transactions = [];
+  const skipped = { noAmount: 0, wrongType: 0, invalid: 0, capped: 0 };
 
-  // 5. For a real transaction, strip the `intent` field (it was only a
-  //    routing hint, not part of the bookkeeping record) and attach
-  //    Telegram's message id so the row can be traced back to the message.
-  const { intent, ...transactionFields } = validated;
+  for (const entry of entries) {
+    if (transactions.length >= MAX_ENTRIES) {
+      skipped.capped++;
 
-  return {
-    intent: "transaction",
-    transaction: {
-      ...transactionFields,
+      continue;
+    }
+
+    const result = MessageSchema.safeParse(entry);
+
+    if (!result.success) {
+      // The prompts say "never invent an amount, use null if missing" while
+      // the schema requires a number — so a missing amount is the single most
+      // common validation failure, and the only one worth naming to the user,
+      // because "how many rupees?" is something they can answer.
+      const aboutAmount = result.error.issues.some((issue) =>
+        issue.path.includes("amount")
+      );
+
+      if (aboutAmount) skipped.noAmount++;
+      else skipped.invalid++;
+
+      continue;
+    }
+
+    // The workspace, not the AI, decides which types may be recorded. This is
+    // what stops a hallucinated credit_sale on a household grocery message
+    // from opening a khata.
+    if (!isTypeAllowedInWorkspace(workspaceType, result.data.transaction_type)) {
+      skipped.wrongType++;
+
+      continue;
+    }
+
+    // Strip `intent` — it was a routing hint, not part of the bookkeeping
+    // record — and attach Telegram's message id so the row traces back to the
+    // message. `seq` is its position among the entries this message records.
+    const { intent, ...fields } = result.data;
+
+    transactions.push({
+      ...fields,
       telegram_message_id: telegramMessageId,
-    },
-  };
+      seq: transactions.length,
+    });
+  }
+
+  // 6. Nothing survived. Say why rather than showing an empty card — and keep
+  //    the existing reasons, so the bot's replies for these cases are the ones
+  //    it already had.
+  if (transactions.length === 0) {
+    if (skipped.wrongType > 0) {
+      return { intent: "unsupported", reason: "TYPE_NOT_IN_WORKSPACE" };
+    }
+
+    if (skipped.noAmount > 0) {
+      return { intent: "unsupported", reason: "NO_AMOUNT" };
+    }
+
+    return { intent: "unsupported", reason: "NOT_UNDERSTOOD" };
+  }
+
+  return { intent: "transaction", transactions, skipped };
 }

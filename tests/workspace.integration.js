@@ -166,7 +166,7 @@ try {
   const confirmed = await confirmMessageTransaction(pending.id, user.id);
 
   check("confirm succeeded", confirmed.success, true);
-  check("transaction filed in the SHOP, not the active home", confirmed.transaction.workspace_id, shop.id);
+  check("transaction filed in the SHOP, not the active home", confirmed.transactions[0].workspace_id, shop.id);
   check("shop now has 3 rows", (await getTransactionsByDate(user.id, shop.id, TODAY)).length, 3);
   check("home still has 3 rows", (await getTransactionsByDate(user.id, home.id, TODAY)).length, 3);
 

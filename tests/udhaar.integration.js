@@ -199,6 +199,119 @@ try {
   )).rows[0].c;
   check("exactly ONE row despite two different answers", tapRows, 1);
 
+  // ------------------------------------------------------------------
+  // SEVERAL ENTRIES FROM ONE MESSAGE
+  // ------------------------------------------------------------------
+  //
+  // Until migration 005 the database physically refused this: a UNIQUE
+  // (user_id, telegram_message_id) meant one message could hold one
+  // transaction, and the ON CONFLICT DO NOTHING in the insert would have
+  // swallowed entries 2..N while still reporting success.
+  console.log("\n--- SEVERAL ENTRIES FROM ONE MESSAGE ---");
+
+  const batchMsgId = 990001;
+
+  let batchSaved = await createMessage({
+    user_id: userA.id,
+    workspace_id: SHOP[userA.id].id,
+    telegram_message_id: batchMsgId,
+    message_text: "dudh 400, sabu 300, chokha 600",
+    status: "RECEIVED",
+  });
+
+  await updateMessageStatus(batchSaved.id, "PROCESSING");
+  await updateMessageTransactionData(
+    batchSaved.id,
+    [
+      { ...txn("purchase", null, 400, "dudh"), telegram_message_id: batchMsgId, seq: 0 },
+      { ...txn("purchase", null, 300, "sabu"), telegram_message_id: batchMsgId, seq: 1 },
+      { ...txn("credit_sale", "BatchRaj", 600, "chokha"), telegram_message_id: batchMsgId, seq: 2 },
+    ]
+  );
+  await updateMessageStatus(batchSaved.id, "PENDING_CONFIRMATION");
+
+  const batch = await confirmMessageTransaction(batchSaved.id, userA.id);
+
+  check("three entries confirm in one tap", batch.transactions.length, 3);
+  check("they come back in order", batch.transactions.map((t) => t.seq), [0, 1, 2]);
+  check("amounts survive intact", batch.transactions.map((t) => Number(t.amount)), [400, 300, 600]);
+
+  const batchRows = (await pool.query(
+    "SELECT COUNT(*)::int c FROM transactions WHERE user_id=$1 AND telegram_message_id=$2",
+    [userA.id, String(batchMsgId)]
+  )).rows[0].c;
+
+  check("all three actually reached the table", batchRows, 3);
+
+  // The khata entry inside the batch still opened a customer ledger.
+  const batchCustomer = await getCustomerByName(userA.id, "BatchRaj");
+
+  check("the udhaar entry in the batch still opened a khata", Boolean(batchCustomer), true);
+  check("and its balance is right", await getCustomerBalance(userA.id, batchCustomer.id), 600);
+
+  // The message is CONFIRMED, so a second tap must add nothing. This is the
+  // guard that replaced the old per-message unique constraint.
+  const batchAgain = await confirmMessageTransaction(batchSaved.id, userA.id);
+
+  check("a second tap is refused", batchAgain.reason, "ALREADY_PROCESSED");
+
+  const batchRowsAfter = (await pool.query(
+    "SELECT COUNT(*)::int c FROM transactions WHERE user_id=$1 AND telegram_message_id=$2",
+    [userA.id, String(batchMsgId)]
+  )).rows[0].c;
+
+  check("still three rows, not six", batchRowsAfter, 3);
+
+  // ALL OR NOTHING. One bad entry must leave the whole message unwritten —
+  // that is what the single Confirm button promises.
+  const badMsgId = 990002;
+
+  let badSaved = await createMessage({
+    user_id: userA.id,
+    workspace_id: SHOP[userA.id].id,
+    telegram_message_id: badMsgId,
+    message_text: "one good, one impossible",
+    status: "RECEIVED",
+  });
+
+  await updateMessageStatus(badSaved.id, "PROCESSING");
+  await updateMessageTransactionData(
+    badSaved.id,
+    [
+      { ...txn("purchase", null, 100, "fine"), telegram_message_id: badMsgId, seq: 0 },
+      // Every column in `transactions` is nullable, so a null cannot be used
+      // to force a failure. A string that will not cast can: the insert binds
+      // this as $9::date and Postgres rejects it outright. That is a genuine
+      // database-level failure partway through the batch, which is what the
+      // all-or-nothing promise has to survive.
+      { ...txn("purchase", null, 200, "broken"), transaction_date: "not-a-date", telegram_message_id: badMsgId, seq: 1 },
+    ]
+  );
+  await updateMessageStatus(badSaved.id, "PENDING_CONFIRMATION");
+
+  let threw = false;
+
+  try {
+    await confirmMessageTransaction(badSaved.id, userA.id);
+  } catch {
+    threw = true;
+  }
+
+  check("a batch with an unwritable entry throws", threw, true);
+
+  const badRows = (await pool.query(
+    "SELECT COUNT(*)::int c FROM transactions WHERE user_id=$1 AND telegram_message_id=$2",
+    [userA.id, String(badMsgId)]
+  )).rows[0].c;
+
+  check("and writes NOTHING, not even the good entry", badRows, 0);
+
+  const badStatus = (await pool.query(
+    "SELECT status FROM messages WHERE id=$1", [badSaved.id]
+  )).rows[0].status;
+
+  check("the message is left pending, not falsely confirmed", badStatus, "PENDING_CONFIRMATION");
+
 } finally {
   console.log("\n--- CLEANUP ---");
   for (const u of [userA, userB]) {

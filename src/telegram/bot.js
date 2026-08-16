@@ -2,7 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { pathToFileURL } from "node:url";
 import "dotenv/config";
 
-import { processMessage } from "../services/transaction.service.js";
+import { processMessage, MAX_ENTRIES } from "../services/transaction.service.js";
 import { getDailySummary } from "../services/summary.service.js";
 import {
   isCustomerTransaction,
@@ -27,10 +27,22 @@ import {
   setActiveWorkspace,
   countOnboardingTransactions,
   finishOnboarding,
+  setUserLanguage,
   pool,
 } from "../database/postgres.js";
 
 import { getMonthlySummary } from "../services/monthly-summary.service.js";
+
+import {
+  LANGUAGES,
+  DEFAULT_LANGUAGE,
+  isLanguage,
+  t,
+  translator,
+  enumLabel,
+  formatDate,
+  formatMonth,
+} from "../i18n/index.js";
 
 // True only when this file is the process entry point. Importing it — from a
 // test, or from server.js if HTTP is ever added back — then defines the
@@ -105,10 +117,22 @@ async function resolveShopkeeper(from, chat) {
 }
 
 // The two ledgers a user can keep, and how they are shown.
-// `name` is only the default at creation — nothing looks a workspace up by it.
+//
+// `nameKey` is only the default name at creation — nothing looks a workspace
+// up by it, which is what makes translating it safe: the name is stored on
+// the row, so an existing ledger keeps whatever it was called and only new
+// ones are created in the user's language.
 const WORKSPACE_KINDS = {
-  shopkeeper: { icon: "🏪", name: "My Shop", label: "Shop" },
-  household: { icon: "🏠", name: "My Home", label: "Household" },
+  shopkeeper: {
+    icon: "🏪",
+    nameKey: "workspace.nameShop",
+    labelKey: "ws.labelShop",
+  },
+  household: {
+    icon: "🏠",
+    nameKey: "workspace.nameHome",
+    labelKey: "ws.labelHome",
+  },
 };
 
 // "🏪 My Shop" — how a workspace is named everywhere in the UI.
@@ -116,53 +140,133 @@ function workspaceLabel(workspace) {
   return `${WORKSPACE_KINDS[workspace.type].icon} ${workspace.name}`;
 }
 
-// ONBOARDING STEP 1 — the gate. Sent whenever a handler needs a workspace and
-// the user has none yet.
+// THE GATE. Sent whenever a handler needs a set-up user and gets one who is
+// not set up yet.
 //
-// No workspace means no ledger, so nothing else in the bot can run: every
-// command and every message routes here until a choice is made. That is what
-// makes onboarding unskippable, and it is why this is sent from ten different
-// places rather than only from /start — most people never type /start, they
-// just say "hii".
+// Setup is two questions — language, then ledger — and this decides which one
+// the user is owed. Every command and every free-text message routes here
+// until both are answered, which is what makes setup unskippable, and it is
+// why this is called from eight places rather than only from /start: most
+// people never type /start, they just say "hii".
+//
+// One function rather than two checks at each call site, so adding a third
+// setup question later is a change here and nowhere else.
+async function startSetup(chatId, user, workspace) {
+  if (!user.language) {
+    await askToChooseLanguage(chatId, user);
+
+    return;
+  }
+
+  if (!workspace) {
+    await askToChooseWorkspace(chatId, user);
+  }
+}
+
+// SETUP STEP 1 — the language.
+//
+// Asked before anything else, because every other word the bot says depends
+// on the answer. This is the one message that cannot be translated — we do
+// not know the language yet — so it carries all three at once and leans on
+// the buttons, which are each written in their own script: somebody who
+// cannot read a word of English still recognises "ગુજરાતી".
+//
+// Also reachable later from /language and from the 🌐 row on /workspace. When
+// a user already has a language, theirs is marked so the picker shows the
+// current setting rather than looking like a fresh question.
+async function askToChooseLanguage(chatId, user) {
+  const buttons = Object.entries(LANGUAGES).map(([code, { label }]) => ({
+    text: user?.language === code ? `${label} ✓` : label,
+    callback_data: `lang:${code}`,
+  }));
+
+  await bot.sendMessage(
+    chatId,
+    `🌐 Choose your language
+भाषा चुनें  ·  ભાષા પસંદ કરો`,
+    {
+      // One row: three short labels fit side by side on any phone, and a
+      // single row reads as one question rather than three options to weigh.
+      reply_markup: { inline_keyboard: [buttons] },
+    }
+  );
+}
+
+// SETUP STEP 2 — the ledger.
+//
+// No workspace means no ledger, so nothing else in the bot can run until this
+// is answered.
 //
 // It greets and explains before it asks. A first-time user who typed "hii"
 // has no idea what this bot is, and being handed two bare buttons is where
 // they quit. The options are labelled by what the user gets, not by the word
 // "workspace", which no shopkeeper thinks in.
 async function askToChooseWorkspace(chatId, user) {
-  // first_name is optional on Telegram accounts, so fall back to no name
-  // rather than greeting "Hi undefined".
-  const greeting = user?.first_name ? `Hi ${user.first_name}!` : "Hello!";
+  const tr = translator(user);
 
-  await bot.sendMessage(
-    chatId,
-    `👋 ${greeting} I'm your bookkeeping assistant.
+  // first_name is optional on Telegram accounts, so fall back to a nameless
+  // greeting rather than "Hi undefined".
+  const greeting = user?.first_name
+    ? tr("setup.greeting", { name: user.first_name })
+    : tr("setup.greetingAnon");
 
-Just type what happened — like "Bought 10 kg rice for ₹600" — and I'll
-write it in your books. No forms, no Excel.
+  await bot.sendMessage(chatId, tr("setup.welcome", { greeting }), {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: tr("setup.shopButton"), callback_data: "addws:shopkeeper" }],
+        [{ text: tr("setup.homeButton"), callback_data: "addws:household" }],
+      ],
+    },
+  });
+}
 
-First, what should I keep books for?
+// Handles every lang:* button.
+//
+// `lang:pick` reopens the picker (the 🌐 row on /workspace); `lang:<code>`
+// sets the language. Callback data comes from the user's Telegram client, so
+// the code is checked here and again in setUserLanguage — a forged `lang:xx`
+// can never reach the database.
+async function handleLanguageAction(query, code) {
+  const chatId = query.message.chat.id;
 
-You can add the other one later, so this is not final.`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "🏪 My Shop — sales, purchases, udhaar",
-              callback_data: "addws:shopkeeper",
-            },
-          ],
-          [
-            {
-              text: "🏠 My Home — household spending",
-              callback_data: "addws:household",
-            },
-          ],
-        ],
-      },
-    }
+  const { user, workspace } = await resolveShopkeeper(
+    query.from,
+    query.message.chat
   );
+
+  if (code === "pick") {
+    await bot.answerCallbackQuery(query.id);
+
+    await askToChooseLanguage(chatId, user);
+
+    return;
+  }
+
+  if (!isLanguage(code)) {
+    await bot.answerCallbackQuery(query.id, { text: translator(user)("toast.unknownLanguage") });
+
+    return;
+  }
+
+  await setUserLanguage(user.id, code);
+
+  await bot.answerCallbackQuery(query.id);
+
+  // `user` was read before the update, so everything below has to be told the
+  // new language explicitly — otherwise the very message confirming the
+  // change would still be written in the language they just left.
+  const updated = { ...user, language: code };
+
+  // A user still in setup carries straight on to the ledger question. One
+  // changing their language later just gets confirmation — same tap, same
+  // function, the only difference is what comes next.
+  if (!workspace) {
+    await askToChooseWorkspace(chatId, updated);
+
+    return;
+  }
+
+  await bot.sendMessage(chatId, translator(updated)("language.changed"));
 }
 
 // True until the user finishes onboarding.
@@ -175,33 +279,32 @@ function isOnboarding(user) {
   return !user.onboarding_done_at;
 }
 
-// The practice message we ask a new user to type, per ledger type.
+// Which catalog key holds the practice example for each ledger type.
 // A purchase for the shop and a grocery expense for the home: both are the
 // most ordinary entry that ledger will ever see, so the example is one they
-// will actually repeat tomorrow.
-const PRACTICE_EXAMPLE = {
-  shopkeeper: "Bought 10 kg rice for ₹600",
-  household: "Bought groceries for ₹500",
+// will actually repeat tomorrow — which is also why it is translated rather
+// than shown in English for a user to copy in a script they do not read.
+const PRACTICE_EXAMPLE_KEY = {
+  shopkeeper: "practice.exampleShop",
+  household: "practice.exampleHome",
 };
 
-// ONBOARDING STEP 2 — asks the user to type their first real transaction.
+// ONBOARDING STEP 3 — asks the user to type their first real transaction.
 //
 // Carries a skip button, because nobody should be held in a tutorial they did
 // not ask for. Skip points at `onb:finish` — the same step the Finish button
 // uses — so skipping is not a separate path with its own rules: it ends
 // onboarding, and still offers to clear anything already recorded.
-async function sendPracticePrompt(chatId, workspace) {
+async function sendPracticePrompt(chatId, user, workspace) {
+  const tr = translator(user);
+
   await bot.sendMessage(
     chatId,
-    `Let's try it once — takes 30 seconds.
-
-Type this, or your own version:
-
-${PRACTICE_EXAMPLE[workspace.type]}`,
+    tr("practice.prompt", { example: tr(PRACTICE_EXAMPLE_KEY[workspace.type]) }),
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "⏭ Skip setup", callback_data: "onb:finish" }],
+          [{ text: tr("practice.skip"), callback_data: "onb:finish" }],
         ],
       },
     }
@@ -213,13 +316,180 @@ function money(value) {
   return `₹${Number(value).toLocaleString("en-IN")}`;
 }
 
+// Apologises to the user in their own language after a handler has failed.
+//
+// Takes a LANGUAGE, not a user, and that is the whole point: `user` is
+// resolved inside the try block, so a catch block referencing it throws
+// ReferenceError and takes the process down with it — an apology that crashes
+// the bot is worse than no apology. Callers hoist a `language` variable above
+// their try and assign it once the user is known.
+//
+// Wrapped in its own try because this runs while something is already broken,
+// and that something is often the database or Telegram itself.
+async function sendError(chatId, language, key) {
+  try {
+    await bot.sendMessage(chatId, t(language ?? DEFAULT_LANGUAGE, key));
+  } catch (error) {
+    console.error("Could not send the error message:", error);
+  }
+}
+
 // Returns today's date as YYYY-MM-DD in the shop's timezone.
 // "en-CA" is used because that locale formats dates as YYYY-MM-DD,
 // which is exactly what PostgreSQL expects for a ::date cast.
+//
+// This is a MACHINE format. Never send it to the user — use formatDate()
+// from the i18n module, which gives "16 ઑગસ્ટ 2026" in their language.
 function today() {
   return new Date().toLocaleDateString("en-CA", {
     timeZone: "Asia/Kolkata",
   });
+}
+
+// The body of the confirmation card, and of the "saved" card after Confirm.
+// Both show the same three rows so tapping Confirm does not reshuffle what
+// the user is looking at.
+//
+//     ખરીદી: 10 કિલો ચોખા
+//     રકમ: ₹600
+//     તારીખ: 16 ઑગસ્ટ 2026
+//
+// The transaction TYPE is the first row's LABEL rather than a value. That is
+// what collapsed the old six rows into three: "Type: expense" and
+// "Description: groceries" were saying the same thing twice, once as a raw
+// database identifier and once in the user's language.
+//
+// Category is deliberately absent. It cannot be corrected from this card, it
+// only feeds the /monthly breakdown, and it was the row duplicating the
+// description.
+function transactionCard(user, transaction) {
+  const tr = translator(user);
+  const language = user?.language ?? "en";
+
+  // For a khata entry the customer IS what the shopkeeper is confirming;
+  // for everything else it is the thing bought or sold.
+  const what = isCustomerTransaction(transaction.transaction_type)
+    ? transaction.person
+    : transaction.description;
+
+  const rows = [
+    `${enumLabel(language, "type", transaction.transaction_type)}: ${what}`,
+  ];
+
+  // A quantity of 1 is every ordinary entry, so printing it said nothing and
+  // read as a second amount sitting above the real one.
+  if (Number(transaction.quantity) > 1) {
+    rows.push(`${tr("confirm.quantity")} ${transaction.quantity}`);
+  }
+
+  rows.push(`${tr("confirm.amount")} ${money(transaction.amount)}`);
+
+  if (transaction.transaction_date) {
+    rows.push(
+      `${tr("confirm.date")} ${formatDate(language, transaction.transaction_date)}`
+    );
+  }
+
+  return rows.join("\n");
+}
+
+// The body of the card when ONE message recorded several entries.
+//
+// One line each rather than N stacked cards, because the entries were typed
+// as one thought ("400 nu dudh, 300 no sabu") and are confirmed as one. The
+// total is what makes a single tap safe to give: it is the number the user
+// checks before agreeing to all of them.
+function transactionListCard(user, transactions) {
+  const tr = translator(user);
+  const language = user?.language ?? DEFAULT_LANGUAGE;
+
+  const dates = new Set(transactions.map((t) => t.transaction_date));
+
+  // Normally every entry in a message is the same day, so the date is stated
+  // once at the bottom. It only moves onto each line when they genuinely
+  // differ — a shared date line would be a quiet lie about half the rows.
+  const sameDay = dates.size === 1;
+
+  const lines = transactions.map((transaction) => {
+    const what = isCustomerTransaction(transaction.transaction_type)
+      ? transaction.person
+      : transaction.description;
+
+    const when = sameDay
+      ? ""
+      : `  ${formatDate(language, transaction.transaction_date, { year: false })}`;
+
+    return `${enumLabel(language, "type", transaction.transaction_type)}: ${what} — ${money(
+      transaction.amount
+    )}${when}`;
+  });
+
+  const total = transactions.reduce(
+    (sum, transaction) => sum + Number(transaction.amount),
+    0
+  );
+
+  const footer = [`${tr("confirm.total")} ${money(total)}`];
+
+  if (sameDay) {
+    footer.push(
+      `${tr("confirm.date")} ${formatDate(language, transactions[0].transaction_date)}`
+    );
+  }
+
+  return `${lines.join("\n")}\n───────────────\n${footer.join("\n")}`;
+}
+
+// What the message could not record, and why — appended under the card.
+//
+// Never silent. Somebody who types five things and gets four back must be
+// told which one is missing now, not discover it in next month's summary.
+function skippedNotes(user, skipped) {
+  const tr = translator(user);
+
+  return Object.entries(skipped ?? {})
+    .filter(([, count]) => count > 0)
+    .map(([reason, count]) =>
+      tr(`skipped.${reason}`, { count, max: MAX_ENTRIES })
+    )
+    .join("\n");
+}
+
+// The money rows shared by /summary and /monthly.
+//
+// A household reports income against expenses and where the money went; a
+// shop reports sales against purchases. Different questions, so this is two
+// layouts rather than one with some rows blanked out.
+//
+// `categories` is off for the daily view: a single day's spending broken down
+// by category is usually one line repeating what is already on screen.
+function summaryBody(user, workspace, summary, { categories = false } = {}) {
+  const tr = translator(user);
+
+  if (workspace.type !== "household") {
+    return `${tr("summary.sales")} ${money(summary.totalSales)}
+${tr("summary.purchases")} ${money(summary.totalPurchases)}
+${tr("summary.expenses")} ${money(summary.totalExpenses)}
+${tr("summary.netBalance")} ${money(summary.netBalance)}`;
+  }
+
+  const rows = `${tr("summary.income")} ${money(summary.totalIncome)}
+${tr("summary.expenses")} ${money(summary.totalExpenses)}
+${tr("summary.balance")} ${money(summary.balance)}`;
+
+  if (!categories || summary.byCategory.length === 0) return rows;
+
+  // byCategory carries the raw database strings, and `category` is a free
+  // z.string() — so enumLabel falls back to whatever the AI wrote rather than
+  // printing a missing key.
+  const breakdown = summary.byCategory
+    .map(
+      (row) =>
+        `${enumLabel(user.language, "cat", row.category)} — ${money(row.total)}`
+    )
+    .join("\n");
+
+  return `${rows}\n\n${tr("summary.whereItWent")}\n${breakdown}`;
 }
 
 // Money from a NAMED person, where the message never said what it was for.
@@ -247,25 +517,27 @@ async function handleWorkspaceAction(query, action, value) {
 
   const { user } = await resolveShopkeeper(query.from, query.message.chat);
 
+  const tr = translator(user);
+
   let workspace;
 
   if (action === "addws") {
     const kind = WORKSPACE_KINDS[value];
 
     if (!kind) {
-      await bot.answerCallbackQuery(query.id, { text: "Unknown workspace." });
+      await bot.answerCallbackQuery(query.id, { text: tr("toast.unknownWorkspace") });
 
       return;
     }
 
-    workspace = await createWorkspace(user.id, kind.name, value);
+    workspace = await createWorkspace(user.id, tr(kind.nameKey), value);
     await setActiveWorkspace(user.id, workspace.id);
   } else {
     // A forged or stale uuid updates nothing and returns undefined.
     const updated = await setActiveWorkspace(user.id, value);
 
     if (!updated) {
-      await bot.answerCallbackQuery(query.id, { text: "Workspace not found." });
+      await bot.answerCallbackQuery(query.id, { text: tr("toast.workspaceNotFound") });
 
       return;
     }
@@ -274,22 +546,28 @@ async function handleWorkspaceAction(query, action, value) {
   }
 
   await bot.answerCallbackQuery(query.id, {
-    text: `Switched to ${workspace.name}`,
+    text: tr("workspace.switched", { workspace: workspace.name }),
   });
 
-  await bot.editMessageText(`✅ Now using ${workspaceLabel(workspace)}`, {
-    chat_id: chatId,
-    message_id: query.message.message_id,
-  });
+  await bot.editMessageText(
+    tr("workspace.nowUsing", { workspace: workspaceLabel(workspace) }),
+    {
+      chat_id: chatId,
+      message_id: query.message.message_id,
+    }
+  );
 
-  // ONBOARDING STEP 2. A first-time user has just answered the only question
+  // ONBOARDING STEP 3. A first-time user has just answered the only question
   // the bot cannot work without, so instead of a one-line hint they get walked
   // through recording something. Somebody adding a SECOND workspace later is
   // not new and keeps the short hint.
   if (isOnboarding(user)) {
-    await bot.sendMessage(chatId, `${workspaceLabel(workspace)} is ready.`);
+    await bot.sendMessage(
+      chatId,
+      tr("workspace.ready", { workspace: workspaceLabel(workspace) })
+    );
 
-    await sendPracticePrompt(chatId, workspace);
+    await sendPracticePrompt(chatId, user, workspace);
 
     return;
   }
@@ -297,8 +575,8 @@ async function handleWorkspaceAction(query, action, value) {
   await bot.sendMessage(
     chatId,
     workspace.type === "household"
-      ? `Send me your household spending, like "Bought groceries for ₹500" or "Salary received ₹65,000".`
-      : `Send me your shop transactions, like "Sold 5 shirts for ₹2,500" or "Raj took goods for ₹2,000 on udhaar".`
+      ? tr("ws.hintHome")
+      : tr("ws.hintShop")
   );
 }
 
@@ -319,11 +597,15 @@ async function handleWorkspaceAction(query, action, value) {
 //
 // WHICH of these a given user sees comes from featuresForWorkspace(), so a
 // household is never offered a khata.
+//
+// `label` is a catalog key rather than the text itself, so the button and the
+// screen it opens can be translated independently — which matters right now,
+// because the buttons are translated and the reports behind them are not yet.
 const TOUR = {
-  summary: { label: "📊 Today's summary", run: sendDailySummary },
-  monthly: { label: "📅 This month", run: sendMonthlySummary },
-  transactions: { label: "📋 Today's entries", run: sendTransactionsList },
-  udhaar: { label: "📒 Who owes me", run: sendUdhaarList },
+  summary: { label: "tour.summary", run: sendDailySummary },
+  monthly: { label: "tour.monthly", run: sendMonthlySummary },
+  transactions: { label: "tour.transactions", run: sendTransactionsList },
+  udhaar: { label: "tour.udhaar", run: sendUdhaarList },
 };
 
 // ONBOARDING STEP 4/5 — the feature tour.
@@ -332,16 +614,18 @@ const TOUR = {
 // out taps Finish once and a user who is curious sees every feature run
 // against their own data in about ten seconds. That is what keeps "takes 30
 // seconds" honest while still covering the whole product.
-async function sendFeatureTour(chatId, workspace, intro) {
+async function sendFeatureTour(chatId, user, workspace, introKey) {
+  const tr = translator(user);
+
   const featureRows = featuresForWorkspace(workspace.type).map((feature) => [
-    { text: TOUR[feature].label, callback_data: `onb:${feature}` },
+    { text: tr(TOUR[feature].label), callback_data: `onb:${feature}` },
   ]);
 
-  await bot.sendMessage(chatId, intro, {
+  await bot.sendMessage(chatId, tr(introKey), {
     reply_markup: {
       inline_keyboard: [
         ...featureRows,
-        [{ text: "✅ Finish setup", callback_data: "onb:finish" }],
+        [{ text: tr("tour.finish"), callback_data: "onb:finish" }],
       ],
     },
   });
@@ -354,23 +638,22 @@ async function sendFeatureTour(chatId, workspace, intro) {
 // button for a week would be clearing real work. "You have 47 practice
 // entries" is what makes that visible before the tap, and Keep is offered
 // with equal weight.
-async function askToClearPracticeData(chatId, count) {
-  const entries = count === 1 ? "1 practice entry" : `${count} practice entries`;
+//
+// The count stands alone in the sentence ("Practice entries: 3") rather than
+// being pluralised into it. English needs entry/entries, Hindi and Gujarati
+// do not pluralise the same way, and a number on its own reads naturally in
+// all three — so there is no plural function to write or get wrong.
+async function askToClearPracticeData(chatId, user, count) {
+  const tr = translator(user);
 
-  await bot.sendMessage(
-    chatId,
-    `Almost done.
-
-You have ${entries} in your books from setup. Clear them so your real accounts start from zero?`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🧹 Clear practice data", callback_data: "onb:clear" }],
-          [{ text: "📌 Keep it", callback_data: "onb:keep" }],
-        ],
-      },
-    }
-  );
+  await bot.sendMessage(chatId, tr("clear.prompt", { count }), {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: tr("clear.button"), callback_data: "onb:clear" }],
+        [{ text: tr("keep.button"), callback_data: "onb:keep" }],
+      ],
+    },
+  });
 }
 
 // The only onboarding steps that exist. Callback data is user-supplied, so
@@ -401,10 +684,14 @@ async function handleOnboardingAction(query, step) {
     query.message.chat
   );
 
+  const tr = translator(user);
+
   // Onboarding is already over — the buttons are on an old message someone
   // scrolled back to. Say so rather than clearing anything.
   if (!isOnboarding(user)) {
-    await bot.answerCallbackQuery(query.id, { text: "Setup is already done." });
+    await bot.answerCallbackQuery(query.id, {
+      text: tr("toast.setupAlreadyDone"),
+    });
 
     return;
   }
@@ -416,7 +703,7 @@ async function handleOnboardingAction(query, step) {
 
     await TOUR[step].run(chatId, user, workspace);
 
-    await sendFeatureTour(chatId, workspace, "What else?");
+    await sendFeatureTour(chatId, user, workspace, "tour.more");
 
     return;
   }
@@ -431,14 +718,14 @@ async function handleOnboardingAction(query, step) {
     if (count === 0) {
       await finishOnboarding(user.id, { clear: false });
 
-      await bot.sendMessage(chatId, `✅ All set.`);
+      await bot.sendMessage(chatId, tr("finish.done"));
 
-      await sendWelcomeHelp(chatId, workspace);
+      await sendWelcomeHelp(chatId, user, workspace);
 
       return;
     }
 
-    await askToClearPracticeData(chatId, count);
+    await askToClearPracticeData(chatId, user, count);
 
     return;
   }
@@ -450,23 +737,34 @@ async function handleOnboardingAction(query, step) {
   const result = await finishOnboarding(user.id, { clear });
 
   await bot.answerCallbackQuery(query.id, {
-    text: clear ? "Practice data cleared." : "Setup complete.",
+    text: clear ? tr("toast.cleared") : tr("toast.setupComplete"),
   });
 
   await bot.editMessageText(
     clear
-      ? `✅ All set. Cleared ${result.transactions} practice ${
-          result.transactions === 1 ? "entry" : "entries"
-        }.`
-      : `✅ All set. Your practice entries are kept.`,
+      ? tr("finish.cleared", { count: result.transactions })
+      : tr("finish.kept"),
     {
       chat_id: chatId,
       message_id: query.message.message_id,
     }
   );
 
-  await sendWelcomeHelp(chatId, workspace);
+  await sendWelcomeHelp(chatId, user, workspace);
 }
+
+// Why nothing in a message could be recorded, and what to say about it.
+//
+// A table rather than a ternary chain because processMessage grew a fourth
+// reason the moment one message could hold several entries, and a chain is
+// where the fifth one gets missed. `?? "error.transaction"` is the fallback,
+// so an unmapped reason apologises rather than printing a key.
+const UNSUPPORTED_KEY = {
+  CUSTOMER_QUERY_OUTSIDE_SHOP: "error.customerQueryAtHome",
+  TYPE_NOT_IN_WORKSPACE: "error.typeNotInWorkspace",
+  NO_AMOUNT: "error.noAmount",
+  NOT_UNDERSTOOD: "error.transaction",
+};
 
 // Maps a clarification button to the transaction type it means.
 // Callback data arrives from the user's Telegram client, so this lookup is
@@ -509,45 +807,26 @@ async function sendMonthlySummary(chatId, user, workspace) {
     workspace.type
   );
 
-  const monthName = now.toLocaleDateString("en-IN", {
-    month: "long",
-    year: "numeric",
-    timeZone: "Asia/Kolkata",
-  });
-
-  // A household reports income against expenses and where the money went;
-  // a shop reports sales against purchases. Different questions, so the
-  // dashboard is not one layout with some rows blanked out.
-  const body =
-    workspace.type === "household"
-      ? `Income: ${money(summary.totalIncome)}
-Expenses: ${money(summary.totalExpenses)}
-Balance: ${money(summary.balance)}${
-          summary.byCategory.length > 0
-            ? `\n\nWhere it went:\n${summary.byCategory
-                .map((row) => `${row.category} — ${money(row.total)}`)
-                .join("\n")}`
-            : ""
-        }`
-      : `Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}`;
+  const tr = translator(user);
 
   await bot.sendMessage(
     chatId,
-    `📊 ${workspaceLabel(workspace)} — Monthly Summary
+    `${tr("summary.monthlyTitle", { workspace: workspaceLabel(workspace) })}
 
-${monthName}
+${formatMonth(user.language, now)}
 
-${body}
+${summaryBody(user, workspace, summary, { categories: true })}
 
-Transactions: ${summary.transactionCount}`
+${tr("summary.count")} ${summary.transactionCount}`
   );
 }
 
 // Generates and sends the current month's financial summary.
 bot.onText(/^\/monthly$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
   try {
     // Scope the summary to this workspace only.
     const { user, workspace } = await resolveShopkeeper(
@@ -555,8 +834,10 @@ bot.onText(/^\/monthly$/, async (message) => {
       message.chat
     );
 
-    if (!workspace) {
-      await askToChooseWorkspace(message.chat.id, user);
+    language = user.language ?? DEFAULT_LANGUAGE;
+
+    if (!user.language || !workspace) {
+      await startSetup(message.chat.id, user, workspace);
 
       return;
     }
@@ -565,10 +846,7 @@ bot.onText(/^\/monthly$/, async (message) => {
   } catch (error) {
     console.error("Monthly summary error:", error);
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't generate the monthly summary."
-    );
+    await sendError(message.chat.id, language, "error.monthly");
   }
 });
 
@@ -576,64 +854,21 @@ bot.onText(/^\/monthly$/, async (message) => {
 // /start
 // --------------------------------------------------
 
-// The "here is how to use me" text for a workspace, sent by /start and again
-// at the end of onboarding. One function rather than two copies so the two
-// can never drift apart as commands are added.
-async function sendWelcomeHelp(chatId, workspace) {
-  if (workspace.type === "household") {
-    await bot.sendMessage(
-      chatId,
-      `👋 You're in ${workspaceLabel(workspace)}.
-
-Just send me your household spending in normal language.
-
-"Bought groceries for ₹500"
-"Paid electricity bill ₹2,400"
-"Salary received ₹65,000"
-"કિરાણા માટે ₹500 ખર્ચ્યા"
-
-Commands:
-
-/summary - Today's income and spending
-/transactions - Today's entries
-/monthly - This month's dashboard
-/workspace - Switch between shop and home
-/help - Show available commands`
-    );
-
-    return;
-  }
+// The "here is how to use me" screen, sent by /start, by /help, and again at
+// the end of onboarding.
+//
+// It branches on the ledger: a household is never shown /udhaar, because a
+// household has no customers. /help used to be a second, near-identical copy
+// of this that showed the shop commands to everybody and patched it with a
+// footnote — it now calls this instead, which is both shorter and correct.
+async function sendWelcomeHelp(chatId, user, workspace) {
+  const tr = translator(user);
 
   await bot.sendMessage(
     chatId,
-    `👋 You're in ${workspaceLabel(workspace)}.
-
-Just send me your shop transactions in normal language.
-
-Buying and selling:
-
-"Bought 10 kg rice for ₹600"
-"Sold 5 shirts for ₹2,500"
-"Paid electricity bill ₹1,800"
-
-Udhaar (credit):
-
-"Raj took goods for ₹2,000 on udhaar"
-"Raj paid ₹1,000"
-
-Ask me anything:
-
-"How much does Raj owe me?"
-"Show Raj's transactions"
-
-Commands:
-
-/summary - Today's financial summary
-/transactions - Today's transactions
-/monthly - Monthly financial summary
-/udhaar - Who owes you money
-/workspace - Switch between shop and home
-/help - Show available commands`
+    tr(workspace.type === "household" ? "help.home" : "help.shop", {
+      workspace: workspaceLabel(workspace),
+    })
   );
 }
 
@@ -650,19 +885,19 @@ bot.onText(/^\/start$/, async (message) => {
     message.chat
   );
 
-  if (!workspace) {
-    await askToChooseWorkspace(message.chat.id, user);
+  if (!user.language || !workspace) {
+    await startSetup(message.chat.id, user, workspace);
 
     return;
   }
 
   if (isOnboarding(user)) {
-    await sendPracticePrompt(message.chat.id, workspace);
+    await sendPracticePrompt(message.chat.id, user, workspace);
 
     return;
   }
 
-  await sendWelcomeHelp(message.chat.id, workspace);
+  await sendWelcomeHelp(message.chat.id, user, workspace);
 });
 
 // --------------------------------------------------
@@ -671,16 +906,22 @@ bot.onText(/^\/start$/, async (message) => {
 
 // Shows which ledger is active and offers to switch or create the other one.
 bot.onText(/^\/workspace$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
   try {
     const { user, workspace } = await resolveShopkeeper(
       message.from,
       message.chat
     );
 
+    language = user.language ?? DEFAULT_LANGUAGE;
+
     const workspaces = await getWorkspaces(user.id);
 
-    if (workspaces.length === 0) {
-      await askToChooseWorkspace(message.chat.id, user);
+    if (!user.language || workspaces.length === 0) {
+      await startSetup(message.chat.id, user, workspaces[0]);
 
       return;
     }
@@ -695,28 +936,67 @@ bot.onText(/^\/workspace$/, async (message) => {
       },
     ]);
 
+    const tr = translator(user);
+
     // Then an "+ Add ..." button for whichever kind they don't have yet.
     for (const [type, kind] of Object.entries(WORKSPACE_KINDS)) {
       if (!workspaces.some((existing) => existing.type === type)) {
         rows.push([
           {
-            text: `+ Add ${kind.label}`,
+            text: tr("ws.add", { label: tr(kind.labelKey) }),
             callback_data: `addws:${type}`,
           },
         ]);
       }
     }
 
-    await bot.sendMessage(message.chat.id, "Current workspace", {
+    // And the language row. This screen is the closest thing the bot has to
+    // settings, so it is where somebody looks for the language — /language
+    // works too, but nobody discovers a command they were never shown.
+    rows.push([
+      {
+        text: tr("language.button", {
+          label: LANGUAGES[user.language].label,
+        }),
+        callback_data: "lang:pick",
+      },
+    ]);
+
+    await bot.sendMessage(message.chat.id, tr("ws.current"), {
       reply_markup: { inline_keyboard: rows },
     });
   } catch (error) {
     console.error("Workspace error:", error);
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't load your workspaces."
-    );
+    await sendError(message.chat.id, language, "error.workspaces");
+  }
+});
+
+// --------------------------------------------------
+// /language
+// --------------------------------------------------
+
+// Reopens the language picker.
+//
+// Deliberately has no workspace gate — language is asked before the ledger,
+// so a user still in setup must be able to correct a mistap here, and an
+// existing user backfilled to English needs a way in that does not depend on
+// having finished anything.
+bot.onText(/^\/language$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
+  try {
+    const { user } = await resolveShopkeeper(message.from, message.chat);
+
+    language = user.language ?? DEFAULT_LANGUAGE;
+
+    await askToChooseLanguage(message.chat.id, user);
+  } catch (error) {
+    console.error("Language error:", error);
+
+    await sendError(message.chat.id, language, "error.language");
   }
 });
 
@@ -724,7 +1004,12 @@ bot.onText(/^\/workspace$/, async (message) => {
 // /help
 // --------------------------------------------------
 
-// Sends the available bot commands and usage examples.
+// Sends the usage examples and the command list.
+//
+// This used to be its own ~35-line block that showed the shop commands to
+// everybody and patched it with a "🏠 in your household workspace…" footnote.
+// It is now the same screen /start sends, which already branches on the
+// ledger — so a household user no longer sees /udhaar at all.
 //
 // Checks for a workspace like every other command: a brand new user handed a
 // list of commands for a ledger that does not exist yet has been shown the
@@ -735,47 +1020,13 @@ bot.onText(/^\/help$/, async (message) => {
     message.chat
   );
 
-  if (!workspace) {
-    await askToChooseWorkspace(message.chat.id, user);
+  if (!user.language || !workspace) {
+    await startSetup(message.chat.id, user, workspace);
 
     return;
   }
 
-  await bot.sendMessage(
-    message.chat.id,
-    `🤖 Bookkeeping Assistant
-
-Send transactions naturally:
-
-"Bought 10 kg rice for ₹600"
-"Sold 5 shirts for ₹2,500"
-"Paid electricity bill ₹1,800"
-"Paid ₹3,000 to supplier"
-
-Udhaar (credit):
-
-"Raj took goods for ₹2,000 on udhaar"
-"Sold goods to Amit for ₹2,500 on credit"
-"Raj paid ₹1,000"
-"Raj cleared his ₹3,000 udhaar"
-
-Ask about a customer:
-
-"How much does Raj owe me?"
-"Show Raj's transactions"
-
-Commands:
-
-/summary - Today's financial summary
-/transactions - Today's transactions
-/monthly - Monthly financial summary
-/udhaar - Who owes you money
-/workspace - Switch between shop and home
-/help - Show this help
-
-🏠 In your household workspace, send things like
-"Bought groceries for ₹500" or "Salary received ₹65,000".`
-  );
+  await sendWelcomeHelp(message.chat.id, user, workspace);
 });
 
 // --------------------------------------------------
@@ -787,6 +1038,10 @@ Commands:
 // Split out of the /transactions command so the onboarding tour can run the
 // real thing from a button. Assumes a workspace exists.
 async function sendTransactionsList(chatId, user, workspace) {
+  const tr = translator(user);
+
+  // `date` is the machine format the query needs; the user is always shown
+  // formatDate() of it.
   const date = today();
 
   const transactions = await getTransactionsByDate(user.id, workspace.id, date);
@@ -794,28 +1049,39 @@ async function sendTransactionsList(chatId, user, workspace) {
   if (transactions.length === 0) {
     await bot.sendMessage(
       chatId,
-      `📋 No transactions found for ${date} in ${workspaceLabel(workspace)}.`
+      tr("list.empty", {
+        date: formatDate(user.language, date),
+        workspace: workspaceLabel(workspace),
+      })
     );
 
     return;
   }
 
+  // The category row is gone for the same reason it left the confirmation
+  // card: it repeated the description and could not be acted on. The type is
+  // now a word rather than a shouted database identifier.
   const transactionList = transactions
     .map(
       (transaction, index) =>
-        `${index + 1}. ${transaction.transaction_type.toUpperCase()}
-${transaction.description} — ${money(transaction.amount)}
-Category: ${transaction.category}${
-          transaction.person ? `\nCustomer: ${transaction.person}` : ""
+        `${index + 1}. ${enumLabel(
+          user.language,
+          "type",
+          transaction.transaction_type
+        )}
+${transaction.description} — ${money(transaction.amount)}${
+          transaction.person
+            ? `\n${tr("list.customer")} ${transaction.person}`
+            : ""
         }`
     )
     .join("\n\n");
 
   await bot.sendMessage(
     chatId,
-    `📋 ${workspaceLabel(workspace)} — Today's Transactions
+    `${tr("list.title", { workspace: workspaceLabel(workspace) })}
 
-Date: ${date}
+${tr("summary.date")} ${formatDate(user.language, date)}
 
 ${transactionList}`
   );
@@ -823,6 +1089,10 @@ ${transactionList}`
 
 // Fetches and displays today's transactions for the user.
 bot.onText(/^\/transactions$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
   try {
     // Scope the list to this workspace only.
     const { user, workspace } = await resolveShopkeeper(
@@ -830,8 +1100,10 @@ bot.onText(/^\/transactions$/, async (message) => {
       message.chat
     );
 
-    if (!workspace) {
-      await askToChooseWorkspace(message.chat.id, user);
+    language = user.language ?? DEFAULT_LANGUAGE;
+
+    if (!user.language || !workspace) {
+      await startSetup(message.chat.id, user, workspace);
 
       return;
     }
@@ -840,10 +1112,7 @@ bot.onText(/^\/transactions$/, async (message) => {
   } catch (error) {
     console.error("Transactions error:", error);
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't get today's transactions."
-    );
+    await sendError(message.chat.id, language, "error.transactions");
   }
 });
 
@@ -864,30 +1133,26 @@ async function sendDailySummary(chatId, user, workspace) {
     workspace.type
   );
 
-  const body =
-    workspace.type === "household"
-      ? `Income: ${money(summary.totalIncome)}
-Expenses: ${money(summary.totalExpenses)}
-Balance: ${money(summary.balance)}`
-      : `Sales: ${money(summary.totalSales)}
-Purchases: ${money(summary.totalPurchases)}
-Expenses: ${money(summary.totalExpenses)}
-Net Balance: ${money(summary.netBalance)}`;
+  const tr = translator(user);
 
   await bot.sendMessage(
     chatId,
-    `📊 ${workspaceLabel(workspace)} — Daily Summary
+    `${tr("summary.dailyTitle", { workspace: workspaceLabel(workspace) })}
 
-Date: ${summary.date}
+${tr("summary.date")} ${formatDate(user.language, summary.date)}
 
-${body}
+${summaryBody(user, workspace, summary)}
 
-Transactions: ${summary.transactionCount}`
+${tr("summary.count")} ${summary.transactionCount}`
   );
 }
 
 // Generates and sends today's financial summary.
 bot.onText(/^\/summary$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
   try {
     // Scope the summary to this workspace only.
     const { user, workspace } = await resolveShopkeeper(
@@ -895,8 +1160,10 @@ bot.onText(/^\/summary$/, async (message) => {
       message.chat
     );
 
-    if (!workspace) {
-      await askToChooseWorkspace(message.chat.id, user);
+    language = user.language ?? DEFAULT_LANGUAGE;
+
+    if (!user.language || !workspace) {
+      await startSetup(message.chat.id, user, workspace);
 
       return;
     }
@@ -905,10 +1172,7 @@ bot.onText(/^\/summary$/, async (message) => {
   } catch (error) {
     console.error("Summary error:", error);
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't generate the summary."
-    );
+    await sendError(message.chat.id, language, "error.summary");
   }
 });
 
@@ -923,12 +1187,11 @@ bot.onText(/^\/summary$/, async (message) => {
 // than in the command wrapper, so a forged `onb:udhaar` from a household user
 // is refused at the same place the command refuses it.
 async function sendUdhaarList(chatId, user, workspace) {
+  const tr = translator(user);
+
   // Udhaar is a khata, and only a shop keeps one.
   if (workspace.type !== "shopkeeper") {
-    await bot.sendMessage(
-      chatId,
-      "📒 Udhaar is a shop feature. Switch to your shop with /workspace to see who owes you money."
-    );
+    await bot.sendMessage(chatId, tr("udhaar.wrongLedger"));
 
     return;
   }
@@ -940,12 +1203,7 @@ async function sendUdhaarList(chatId, user, workspace) {
     // "Everyone has cleared their balance" reads as a mistake to a shopkeeper
     // who has never lent to anybody — which is exactly who taps this during
     // onboarding.
-    await bot.sendMessage(
-      chatId,
-      `📒 Nobody owes you money right now.
-
-When you record something like "Raj took goods for ₹2,000 on udhaar", Raj will appear here until he pays it back.`
-    );
+    await bot.sendMessage(chatId, tr("udhaar.empty"));
 
     return;
   }
@@ -964,27 +1222,33 @@ When you record something like "Raj took goods for ₹2,000 on udhaar", Raj will
 
   await bot.sendMessage(
     chatId,
-    `📒 Udhaar Book
+    `${tr("udhaar.title")}
 
 ${list}
 
-Total pending: ${money(total)}`
+${tr("udhaar.total")} ${money(total)}`
   );
 }
 
 // Shows every customer who still owes this shopkeeper money.
 bot.onText(/^\/udhaar$/, async (message) => {
+  // Resolved inside the try below, but the catch needs it too — a catch block
+  // that reaches for `user` throws ReferenceError and kills the process.
+  let language = DEFAULT_LANGUAGE;
+
   try {
     const { user, workspace } = await resolveShopkeeper(
       message.from,
       message.chat
     );
 
+    language = user.language ?? DEFAULT_LANGUAGE;
+
     // A user with NO workspace gets the ledger question, like every other
     // command. Telling them to "switch to your shop" was a dead end: they do
     // not have a shop to switch to yet.
-    if (!workspace) {
-      await askToChooseWorkspace(message.chat.id, user);
+    if (!user.language || !workspace) {
+      await startSetup(message.chat.id, user, workspace);
 
       return;
     }
@@ -993,10 +1257,7 @@ bot.onText(/^\/udhaar$/, async (message) => {
   } catch (error) {
     console.error("Udhaar list error:", error);
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't load the udhaar book."
-    );
+    await sendError(message.chat.id, language, "error.udhaar");
   }
 });
 
@@ -1007,15 +1268,14 @@ bot.onText(/^\/udhaar$/, async (message) => {
 // Answers "How much does Raj owe me?".
 // Read-only: nothing is created, so this never enters the confirmation flow.
 async function answerBalanceQuery(chatId, user, personName) {
+  const tr = translator(user);
+
   const customer = await getCustomerByName(user.id, personName);
 
   // The shopkeeper has no such customer. Say so instead of showing ₹0,
   // which would look like a cleared balance.
   if (!customer) {
-    await bot.sendMessage(
-      chatId,
-      `🔍 No customer named "${personName}" in your khata yet.`
-    );
+    await bot.sendMessage(chatId, tr("khata.noCustomer", { person: personName }));
 
     return;
   }
@@ -1023,10 +1283,7 @@ async function answerBalanceQuery(chatId, user, personName) {
   const balance = await getCustomerBalance(user.id, customer.id);
 
   if (balance === 0) {
-    await bot.sendMessage(
-      chatId,
-      `✅ ${customer.name} has cleared all udhaar. Outstanding: ₹0`
-    );
+    await bot.sendMessage(chatId, tr("khata.cleared", { person: customer.name }));
 
     return;
   }
@@ -1036,9 +1293,10 @@ async function answerBalanceQuery(chatId, user, personName) {
   if (balance < 0) {
     await bot.sendMessage(
       chatId,
-      `💰 ${customer.name} has paid ${money(
-        Math.abs(balance)
-      )} in advance (no pending udhaar).`
+      tr("khata.paidAdvance", {
+        person: customer.name,
+        amount: money(Math.abs(balance)),
+      })
     );
 
     return;
@@ -1046,19 +1304,18 @@ async function answerBalanceQuery(chatId, user, personName) {
 
   await bot.sendMessage(
     chatId,
-    `📒 ${customer.name} owes you ${money(balance)}.`
+    tr("khata.owesYou", { person: customer.name, amount: money(balance) })
   );
 }
 
 // Answers "Show Raj's transactions" with that customer's udhaar entries.
 async function answerHistoryQuery(chatId, user, personName) {
+  const tr = translator(user);
+
   const customer = await getCustomerByName(user.id, personName);
 
   if (!customer) {
-    await bot.sendMessage(
-      chatId,
-      `🔍 No customer named "${personName}" in your khata yet.`
-    );
+    await bot.sendMessage(chatId, tr("khata.noCustomer", { person: personName }));
 
     return;
   }
@@ -1066,10 +1323,7 @@ async function answerHistoryQuery(chatId, user, personName) {
   const transactions = await getCustomerTransactions(user.id, customer.id);
 
   if (transactions.length === 0) {
-    await bot.sendMessage(
-      chatId,
-      `📋 No entries yet for ${customer.name}.`
-    );
+    await bot.sendMessage(chatId, tr("khata.noEntries", { person: customer.name }));
 
     return;
   }
@@ -1082,12 +1336,9 @@ async function answerHistoryQuery(chatId, user, personName) {
       const sign =
         transaction.transaction_type === "credit_sale" ? "＋" : "－";
 
-      const date = new Date(
-        transaction.transaction_date
-      ).toLocaleDateString("en-IN", {
-        day: "2-digit",
-        month: "short",
-        timeZone: "Asia/Kolkata",
+      // No year: every row is the same khata and the year is noise.
+      const date = formatDate(user.language, transaction.transaction_date, {
+        year: false,
       });
 
       return `${sign} ${money(transaction.amount)}  ${date}
@@ -1097,11 +1348,11 @@ async function answerHistoryQuery(chatId, user, personName) {
 
   await bot.sendMessage(
     chatId,
-    `📋 ${customer.name}'s Khata
+    `${tr("khata.title", { person: customer.name })}
 
 ${list}
 
-Outstanding: ${money(balance)}`
+${tr("khata.outstanding")} ${money(balance)}`
   );
 }
 
@@ -1114,54 +1365,63 @@ Outstanding: ${money(balance)}`
 //
 // The customer's current outstanding is shown because that is the number
 // the shopkeeper needs in order to answer correctly.
+// `index` names WHICH entry is being asked about when one message recorded
+// several. null for a single-entry message, which keeps that callback data
+// byte-identical to what it has always been — and keeps its one-tap
+// confirm-and-save behaviour, see the callback handler.
 async function askPaymentClarification(
   chatId,
   user,
   transaction,
-  telegramMessageId
+  telegramMessageId,
+  index = null
 ) {
+  const tr = translator(user);
+
+  const suffix = index === null ? "" : `:${index}`;
+
   const customer = await getCustomerByName(user.id, transaction.person);
 
   // A customer with no khata yet still gets the question: the shopkeeper may
   // have given the udhaar verbally before ever recording it here.
   const khataLine = customer
-    ? `\n${transaction.person} currently owes: ${money(
-        await getCustomerBalance(user.id, customer.id)
-      )}`
-    : `\n${transaction.person} has no udhaar recorded yet.`;
+    ? tr("clarify.owes", {
+        person: transaction.person,
+        amount: money(await getCustomerBalance(user.id, customer.id)),
+      })
+    : tr("clarify.noUdhaar", { person: transaction.person });
 
   await bot.sendMessage(
     chatId,
-    `📝 Please confirm
+    `${tr("confirm.title")}
 
-Amount: ${money(transaction.amount)}
-From: ${transaction.person}
-Description: ${transaction.description}
-Date: ${new Date(transaction.transaction_date).toLocaleDateString("en-IN", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-      timeZone: "Asia/Kolkata",
-    })}
+${tr("confirm.amount")} ${money(transaction.amount)}
+${tr("confirm.from")} ${transaction.person}
+${tr("confirm.description")} ${transaction.description}
+${tr("confirm.date")} ${formatDate(
+      user?.language ?? DEFAULT_LANGUAGE,
+      transaction.transaction_date
+    )}
+
 ${khataLine}
 
-❓ Did ${transaction.person} pay this toward their udhaar, or is this a normal payment?`,
+${tr("clarify.question", { person: transaction.person })}`,
     {
       reply_markup: {
         inline_keyboard: [
           [
             {
-              text: "📒 Udhaar Repayment",
-              callback_data: `repayment:${telegramMessageId}`,
+              text: tr("clarify.repayment"),
+              callback_data: `repayment:${telegramMessageId}${suffix}`,
             },
             {
-              text: "💰 Normal Payment",
-              callback_data: `income:${telegramMessageId}`,
+              text: tr("clarify.normal"),
+              callback_data: `income:${telegramMessageId}${suffix}`,
             },
           ],
           [
             {
-              text: "❌ Cancel",
+              text: tr("confirm.no"),
               callback_data: `cancel:${telegramMessageId}`,
             },
           ],
@@ -1169,6 +1429,104 @@ ${khataLine}
       },
     }
   );
+}
+
+// The step between "the AI understood you" and "waiting for a yes".
+//
+// It either asks the next unanswered clarification question or shows the
+// confirm card. Both the message handler and the clarification callback call
+// it, which is what lets a multi-entry message ask about entry 2 after entry
+// 0 has been answered without either side owning the state machine.
+async function askToConfirm(
+  chatId,
+  user,
+  transactions,
+  skipped,
+  telegramMessageId
+) {
+  const tr = translator(user);
+
+  // Money from a named person with no stated reason moves a khata balance if
+  // guessed wrong, so it is asked about before anything can be saved.
+  const unanswered = transactions.findIndex(needsPaymentClarification);
+
+  if (unanswered !== -1) {
+    await askPaymentClarification(
+      chatId,
+      user,
+      transactions[unanswered],
+      telegramMessageId,
+      // A single-entry message needs no index: its callback data, and its
+      // one-tap behaviour, stay exactly as they were.
+      transactions.length > 1 ? unanswered : null
+    );
+
+    return;
+  }
+
+  const multi = transactions.length > 1;
+
+  // For udhaar entries, show what the customer owes right now so the
+  // shopkeeper sees the before/after before committing to it.
+  const khataLines = [];
+
+  for (const transaction of transactions) {
+    if (
+      !isCustomerTransaction(transaction.transaction_type) ||
+      !transaction.person
+    ) {
+      continue;
+    }
+
+    const customer = await getCustomerByName(user.id, transaction.person);
+    const current = customer ? await getCustomerBalance(user.id, customer.id) : 0;
+
+    const after =
+      transaction.transaction_type === "credit_sale"
+        ? current + Number(transaction.amount)
+        : current - Number(transaction.amount);
+
+    khataLines.push(
+      tr("confirm.khataChange", {
+        person: transaction.person,
+        before: money(current),
+        after: money(after),
+      })
+    );
+  }
+
+  const parts = [
+    multi
+      ? tr("confirm.titleMulti", { count: transactions.length })
+      : tr("confirm.title"),
+    "",
+    multi
+      ? transactionListCard(user, transactions)
+      : transactionCard(user, transactions[0]),
+  ];
+
+  if (khataLines.length > 0) parts.push("", khataLines.join("\n"));
+
+  const notes = skippedNotes(user, skipped);
+
+  if (notes) parts.push("", notes);
+
+  await bot.sendMessage(chatId, parts.join("\n"), {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: tr("confirm.yes"),
+            callback_data: `confirm:${telegramMessageId}`,
+          },
+          {
+            text: tr("confirm.no"),
+            callback_data: `cancel:${telegramMessageId}`,
+          },
+        ],
+      ],
+    },
+  });
 }
 
 // --------------------------------------------------
@@ -1233,10 +1591,12 @@ bot.on("message", async (message) => {
 
   if (over) {
     if (over === 1) {
-      await bot.sendMessage(
-        message.chat.id,
-        "That's a lot at once — give me a minute to catch up, then carry on."
-      );
+      // Only the message that CROSSES the limit gets a reply, so this costs
+      // one query per flood, not one per message — cheap enough to answer a
+      // flooding user in their own language rather than in English.
+      const { user } = await resolveShopkeeper(message.from, message.chat);
+
+      await bot.sendMessage(message.chat.id, translator(user)("error.rateLimit"));
     }
 
     return;
@@ -1248,8 +1608,14 @@ bot.on("message", async (message) => {
   let savedMessage;
 
   // Set only while the sender is still onboarding, for the same scoping
-  // reason: the catch below needs it to answer a beginner differently.
+  // reason: the catch below needs them to answer a beginner differently, in
+  // their own language. Both are assigned together and neither is read unless
+  // the other is set.
+  let onboardingUser;
   let onboardingWorkspace;
+
+  // Same reason again: the catch apologises, and it cannot reach `user`.
+  let language = DEFAULT_LANGUAGE;
 
   try {
     // Find or create the shopkeeper from Telegram information.
@@ -1258,15 +1624,20 @@ bot.on("message", async (message) => {
       message.chat
     );
 
+    language = user.language ?? DEFAULT_LANGUAGE;
+
     // Without a workspace there is no ledger to write to. Ask before
     // spending an AI call on a message that has nowhere to go.
-    if (!workspace) {
-      await askToChooseWorkspace(message.chat.id, user);
+    if (!user.language || !workspace) {
+      await startSetup(message.chat.id, user, workspace);
 
       return;
     }
 
+    const tr = translator(user);
+
     if (isOnboarding(user)) {
+      onboardingUser = user;
       onboardingWorkspace = workspace;
     }
 
@@ -1299,11 +1670,13 @@ bot.on("message", async (message) => {
 
     // Ask Groq what this message means and validate the answer with Zod.
     // The workspace type picks which rules the AI is given and which
-    // transaction types are allowed back.
+    // transaction types are allowed back; the language decides only which
+    // language the description comes back in.
     const result = await processMessage(
       message.text,
       message.message_id,
-      workspace.type
+      workspace.type,
+      user.language
     );
 
     // The message made sense but does not belong in this ledger — a customer
@@ -1314,17 +1687,13 @@ bot.on("message", async (message) => {
       // bookkeeping. Repeating the practice prompt keeps a brand new user on
       // the rails; advice about /workspace means nothing to them yet.
       if (isOnboarding(user)) {
-        await sendPracticePrompt(message.chat.id, workspace);
+        await sendPracticePrompt(message.chat.id, user, workspace);
       } else {
         await bot.sendMessage(
           message.chat.id,
-          result.reason === "CUSTOMER_QUERY_OUTSIDE_SHOP"
-            ? `That's a customer question, and ${workspaceLabel(
-                workspace
-              )} has no customers. Switch to your shop with /workspace.`
-            : `I couldn't record that in ${workspaceLabel(
-                workspace
-              )}. Try rephrasing, or switch workspace with /workspace.`
+          tr(UNSUPPORTED_KEY[result.reason] ?? "error.transaction", {
+            workspace: workspaceLabel(workspace),
+          })
         );
       }
 
@@ -1355,13 +1724,10 @@ bot.on("message", async (message) => {
     // A real transaction: store it and wait for confirmation.
     // ----------------------------------------------
 
-    // Store the AI-generated transaction data in PostgreSQL.
-    // This is why no in-memory Map is needed: the pending transaction
-    // survives a server restart because PostgreSQL holds it.
-    await updateMessageTransactionData(
-      savedMessage.id,
-      result.transaction
-    );
+    // Store the AI-generated entries in PostgreSQL — an ARRAY, since one
+    // message can record several. This is why no in-memory Map is needed: the
+    // pending entries survive a server restart because PostgreSQL holds them.
+    await updateMessageTransactionData(savedMessage.id, result.transactions);
 
     // AI processing succeeded, so wait for user confirmation.
     await updateMessageStatus(
@@ -1369,80 +1735,13 @@ bot.on("message", async (message) => {
       "PENDING_CONFIRMATION"
     );
 
-    // The AI could not tell what this money was for. Ask before offering to
-    // save anything — a wrong guess here would move a customer's balance.
-    if (needsPaymentClarification(result.transaction)) {
-      await askPaymentClarification(
-        message.chat.id,
-        user,
-        result.transaction,
-        message.message_id
-      );
-
-      return;
-    }
-
-    // For udhaar entries, show what the customer owes right now so the
-    // shopkeeper can see the before/after before committing to it.
-    let khataLine = "";
-
-    if (
-      isCustomerTransaction(result.transaction.transaction_type) &&
-      result.transaction.person
-    ) {
-      const customer = await getCustomerByName(
-        user.id,
-        result.transaction.person
-      );
-
-      const current = customer
-        ? await getCustomerBalance(user.id, customer.id)
-        : 0;
-
-      const after =
-        result.transaction.transaction_type === "credit_sale"
-          ? current + Number(result.transaction.amount)
-          : current - Number(result.transaction.amount);
-
-      khataLine = `\nCustomer: ${result.transaction.person}
-Currently owes: ${money(current)}
-After this entry: ${money(after)}`;
-    }
-
-    // Show the transaction preview with Confirm / Cancel buttons.
-    await bot.sendMessage(
+    // Ask the first unanswered "what was this money for?", or show the card.
+    await askToConfirm(
       message.chat.id,
-      `📝 Please confirm
-
-Type: ${result.transaction.transaction_type}
-Description: ${result.transaction.description}
-Category: ${result.transaction.category}
-Quantity: ${result.transaction.quantity}
-Amount: ${money(result.transaction.amount)}
-Date: ${new Date(
-        result.transaction.transaction_date
-      ).toLocaleDateString("en-IN", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-        timeZone: "Asia/Kolkata",
-      })}${khataLine}`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "✅ Confirm",
-                callback_data: `confirm:${message.message_id}`,
-              },
-              {
-                text: "❌ Cancel",
-                callback_data: `cancel:${message.message_id}`,
-              },
-            ],
-          ],
-        },
-      }
+      user,
+      result.transactions,
+      result.skipped,
+      message.message_id
     );
   } catch (error) {
     console.error(
@@ -1464,15 +1763,16 @@ Date: ${new Date(
     // back, not an apology about a transaction they never tried to record.
     // The message is still marked FAILED above either way.
     if (onboardingWorkspace) {
-      await sendPracticePrompt(message.chat.id, onboardingWorkspace);
+      await sendPracticePrompt(
+        message.chat.id,
+        onboardingUser,
+        onboardingWorkspace
+      );
 
       return;
     }
 
-    await bot.sendMessage(
-      message.chat.id,
-      "Sorry, I couldn't process that transaction."
-    );
+    await sendError(message.chat.id, language, "error.transaction");
   }
 });
 
@@ -1483,14 +1783,34 @@ Date: ${new Date(
 // Handles Confirm / Cancel button clicks using PostgreSQL
 // as the source of truth instead of an in-memory Map.
 bot.on("callback_query", async (query) => {
+  // Outside the try so the catch below can apologise in the user's language.
+  // Set once the user is known; the catch never queries for it, because what
+  // it is apologising for may well be the database being unreachable.
+  let language = DEFAULT_LANGUAGE;
+
   try {
-    const [action, messageId] = query.data.split(":");
+    // A clarification button on a multi-entry message carries a third part
+    // naming WHICH entry it answers — `repayment:4821:2`. Single-entry
+    // messages send no index, exactly as before.
+    const [action, messageId, entryIndex] = query.data.split(":");
 
     // Workspace buttons carry a uuid or a workspace type, not a Telegram
     // message id, so they are handled BEFORE the Number() parse below —
     // which would otherwise turn them into NaN.
     if (action === "ws" || action === "addws") {
       await handleWorkspaceAction(query, action, messageId);
+
+      return;
+    }
+
+    // Language buttons carry a language code or the literal "pick", for the
+    // same reason — and the guard is the whitelist, so a forged `lang:xx`
+    // never reaches the database.
+    //
+    //   lang:pick   reopen the picker (the 🌐 row on /workspace)
+    //   lang:gu     set the language
+    if (action === "lang" && (messageId === "pick" || isLanguage(messageId))) {
+      await handleLanguageAction(query, messageId);
 
       return;
     }
@@ -1517,6 +1837,10 @@ bot.on("callback_query", async (query) => {
       query.message.chat
     );
 
+    const tr = translator(user);
+
+    language = user.language ?? DEFAULT_LANGUAGE;
+
     // Retrieve the original message and its transaction data
     // from PostgreSQL.
     const savedMessage =
@@ -1528,7 +1852,7 @@ bot.on("callback_query", async (query) => {
     // The message does not exist in PostgreSQL.
     if (!savedMessage) {
       await bot.answerCallbackQuery(query.id, {
-        text: "Transaction not found.",
+        text: tr("toast.notFound"),
       });
 
       return;
@@ -1537,31 +1861,76 @@ bot.on("callback_query", async (query) => {
     // Only a pending transaction can be confirmed or cancelled.
     if (savedMessage.status !== "PENDING_CONFIRMATION") {
       await bot.answerCallbackQuery(query.id, {
-        text: `Transaction already ${savedMessage.status.toLowerCase()}.`,
+        text: tr("toast.alreadyDone"),
       });
 
       return;
     }
 
-    // The AI-generated transaction data is stored in PostgreSQL.
-    const transaction = savedMessage.transaction_data;
+    // The AI-generated entries, stored in PostgreSQL. Always read as a list:
+    // rows written before one message could hold several hold a bare object.
+    const transactions = [savedMessage.transaction_data ?? []].flat();
 
     // Make sure transaction data exists before continuing.
-    if (!transaction) {
+    if (transactions.length === 0) {
       await bot.answerCallbackQuery(query.id, {
-        text: "Transaction data not found.",
+        text: tr("toast.dataMissing"),
       });
 
       return;
     }
 
     // An ambiguous payment can only be saved through a clarification button.
-    // The plain Confirm button is never shown for one, but callback data
-    // comes from the user's client, so refuse it here rather than trust that.
-    if (action === "confirm" && needsPaymentClarification(transaction)) {
+    // The plain Confirm button is never shown while one is unanswered, but
+    // callback data comes from the user's client, so refuse it here rather
+    // than trust that.
+    if (action === "confirm" && transactions.some(needsPaymentClarification)) {
       await bot.answerCallbackQuery(query.id, {
-        text: "Please choose what this payment was for.",
+        text: tr("toast.chooseFirst"),
       });
+
+      return;
+    }
+
+    // A clarification answer on a MULTI-entry message records the choice and
+    // moves on to the next question, rather than confirming — nothing is
+    // written until the final Yes on the card that lists everything.
+    //
+    // A single-entry message keeps its original behaviour, where the same tap
+    // both answers and saves. Two paths, but the common one is untouched.
+    if (entryIndex !== undefined && CLARIFIED_TYPE[action]) {
+      const index = Number(entryIndex);
+
+      if (!transactions[index]) {
+        await bot.answerCallbackQuery(query.id, { text: tr("toast.notFound") });
+
+        return;
+      }
+
+      transactions[index].transaction_type = CLARIFIED_TYPE[action];
+
+      await updateMessageTransactionData(savedMessage.id, transactions);
+
+      await bot.answerCallbackQuery(query.id);
+
+      // Replace the question so it cannot be answered twice.
+      await bot.editMessageText(
+        `${tr("clarify.question", { person: transactions[index].person })}
+${enumLabel(language, "type", CLARIFIED_TYPE[action])} ✅`,
+        {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+        }
+      );
+
+      // Ask the next one, or show the card now that none are left.
+      await askToConfirm(
+        query.message.chat.id,
+        user,
+        transactions,
+        null,
+        telegramMessageId
+      );
 
       return;
     }
@@ -1578,12 +1947,12 @@ bot.on("callback_query", async (query) => {
       );
 
       await bot.answerCallbackQuery(query.id, {
-        text: "Transaction cancelled.",
+        text: tr("toast.cancelled"),
       });
 
       // Replace the confirmation message with the cancellation result.
       await bot.editMessageText(
-        "❌ Transaction cancelled.",
+        tr("confirm.cancelled"),
         {
           chat_id: query.message.chat.id,
           message_id: query.message.message_id,
@@ -1610,7 +1979,7 @@ bot.on("callback_query", async (query) => {
       // The message was not found.
       if (result.reason === "NOT_FOUND") {
         await bot.answerCallbackQuery(query.id, {
-          text: "Transaction not found.",
+          text: tr("toast.notFound"),
         });
 
         return;
@@ -1620,7 +1989,7 @@ bot.on("callback_query", async (query) => {
       // or otherwise processed.
       if (result.reason === "ALREADY_PROCESSED") {
         await bot.answerCallbackQuery(query.id, {
-          text: `Transaction already ${result.status.toLowerCase()}.`,
+          text: tr("toast.alreadyDone"),
         });
 
         return;
@@ -1629,7 +1998,7 @@ bot.on("callback_query", async (query) => {
       // Transaction data is missing from the message.
       if (result.reason === "TRANSACTION_DATA_MISSING") {
         await bot.answerCallbackQuery(query.id, {
-          text: "Transaction data not found.",
+          text: tr("toast.dataMissing"),
         });
 
         return;
@@ -1638,41 +2007,64 @@ bot.on("callback_query", async (query) => {
       // The transaction was successfully created
       // and the message was marked as CONFIRMED.
       if (result.success) {
-        const savedTransaction = result.transaction;
+        const saved = result.transactions;
+        const multi = saved.length > 1;
 
         await bot.answerCallbackQuery(query.id, {
-          text: "Transaction saved!",
+          text: multi
+            ? tr("toast.savedMulti", { count: saved.length })
+            : tr("toast.saved"),
         });
 
-        // For udhaar entries, show the customer's new outstanding balance
-        // so the shopkeeper gets immediate confirmation of the khata.
-        let khataLine = "";
+        // For udhaar entries, show each customer's new outstanding balance so
+        // the shopkeeper gets immediate confirmation of the khata.
+        //
+        // Balances are read AFTER the commit and per customer, so two entries
+        // naming the same person both show the final figure rather than a
+        // half-applied one.
+        const khataLines = [];
 
-        if (savedTransaction.customer_id) {
+        for (const transaction of saved) {
+          if (!transaction.customer_id) continue;
+
           const balance = await getCustomerBalance(
             user.id,
-            savedTransaction.customer_id
+            transaction.customer_id
           );
 
           // A repayment can overshoot the debt, leaving a negative balance.
           // "owes ₹-4,000" reads as nonsense to a shopkeeper, so a negative
           // is phrased as advance money held — matching how the balance
           // question answers it.
-          khataLine =
+          khataLines.push(
             balance < 0
-              ? `\n\n📒 ${savedTransaction.person} has paid ${money(
-                  Math.abs(balance)
-                )} in advance`
-              : `\n\n📒 ${savedTransaction.person} now owes ${money(balance)}`;
+              ? tr("khata.advance", {
+                  person: transaction.person,
+                  amount: money(Math.abs(balance)),
+                })
+              : tr("khata.nowOwes", {
+                  person: transaction.person,
+                  amount: money(balance),
+                })
+          );
         }
 
-        // Replace the confirmation message with the saved result.
-        await bot.editMessageText(
-          `✅ Transaction saved
+        const khataLine =
+          khataLines.length > 0 ? `\n\n${[...new Set(khataLines)].join("\n")}` : "";
 
-Type: ${savedTransaction.transaction_type}
-Description: ${savedTransaction.description}
-Amount: ${money(savedTransaction.amount)}${khataLine}`,
+        // Replace the confirmation message with the saved result — the same
+        // shape the user just approved, so the card does not rearrange itself
+        // under them. Only the title and the khata line change.
+        await bot.editMessageText(
+          `${
+            multi
+              ? tr("confirm.savedTitleMulti", { count: saved.length })
+              : tr("confirm.savedTitle")
+          }
+
+${
+  multi ? transactionListCard(user, saved) : transactionCard(user, saved[0])
+}${khataLine}`,
           {
             chat_id: query.message.chat.id,
             message_id: query.message.message_id,
@@ -1687,10 +2079,9 @@ Amount: ${money(savedTransaction.amount)}${khataLine}`,
         if (isOnboarding(user)) {
           await sendFeatureTour(
             query.message.chat.id,
+            user,
             workspace,
-            `🎉 That's the whole app — type it, tap Confirm.
-
-Want to see what else I can do?`
+            "tour.intro"
           );
         }
 
@@ -1700,7 +2091,7 @@ Want to see what else I can do?`
 
     // Unknown callback action.
     await bot.answerCallbackQuery(query.id, {
-      text: "Unknown action.",
+      text: tr("toast.unknownAction"),
     });
   } catch (error) {
     console.error(
@@ -1709,7 +2100,7 @@ Want to see what else I can do?`
     );
 
     await bot.answerCallbackQuery(query.id, {
-      text: "Something went wrong.",
+      text: t(language, "toast.wentWrong"),
     });
   }
 });

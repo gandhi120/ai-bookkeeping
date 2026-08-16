@@ -359,6 +359,58 @@ check("an unknown workspace type offers nothing", () => {
   assert.deepEqual(featuresForWorkspace(undefined), []);
 });
 
+console.log("\nOne message can carry several entries:");
+
+// The bug this covers: the AI answered "400 nu dudh, 300 no sabu" with a JSON
+// ARRAY of two transactions, MessageSchema.parse threw "expected object,
+// received array", and the user was told the bot did not understand something
+// it had understood perfectly.
+check("a list of entries parses, one at a time", () => {
+  const entries = [
+    transaction({ description: "dudh", amount: 400 }),
+    transaction({ description: "sabu", amount: 300 }),
+  ];
+
+  const parsed = entries.map((entry) => MessageSchema.parse(entry));
+
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].amount, 400);
+  assert.equal(parsed[1].amount, 300);
+});
+
+// processMessage normalizes with `[parsed].flat()` so a model that answers a
+// one-entry message with a bare object is not a failure.
+check("[x].flat() accepts a bare object and a list alike", () => {
+  const one = transaction();
+
+  assert.deepEqual([one].flat(), [one]);
+  assert.deepEqual([[one, one]].flat(), [one, one]);
+});
+
+// The prompts say "never invent an amount, use null if missing" while the
+// schema requires a number, so a null amount is the most common single-entry
+// failure. It must FAIL here — that is what lets processMessage drop just
+// that entry and keep the others, instead of losing the whole message.
+check("an entry with no amount is rejected, so it can be skipped", () => {
+  const result = MessageSchema.safeParse(transaction({ amount: null }));
+
+  assert.equal(result.success, false);
+  assert.ok(
+    result.error.issues.some((issue) => issue.path.includes("amount")),
+    "the failure must name `amount` so it can be reported as a missing amount"
+  );
+});
+
+check("one bad entry does not invalidate its neighbours", () => {
+  const results = [
+    transaction({ amount: 400 }),
+    transaction({ amount: null }),
+    transaction({ amount: 300 }),
+  ].map((entry) => MessageSchema.safeParse(entry).success);
+
+  assert.deepEqual(results, [true, false, true]);
+});
+
 console.log(
   `\n${passed} checks passed${process.exitCode ? " — SOME FAILED" : ""}\n`
 );
