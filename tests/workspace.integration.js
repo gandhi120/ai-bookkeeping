@@ -8,23 +8,29 @@
 
 import "dotenv/config";
 
+import { pool } from "../src/database/pool.js";
+import { findOrCreateUser } from "../src/database/users.js";
 import {
-  pool,
-  findOrCreateUser,
-  createMessage,
-  updateMessageStatus,
-  updateMessageTransactionData,
-  confirmMessageTransaction,
-  getCustomerByName,
-  getCustomerBalance,
-  getAllOutstanding,
-  getTransactionsByDate,
-  getTransactionsByMonth,
   getWorkspaces,
   getActiveWorkspace,
   createWorkspace,
   setActiveWorkspace,
-} from "../src/database/postgres.js";
+} from "../src/database/workspaces.js";
+import {
+  confirmMessageTransaction,
+  getTransactionsByDate,
+  getTransactionsByMonth,
+} from "../src/database/transactions.js";
+import {
+  createMessage,
+  updateMessageStatus,
+  updateMessageTransactionData,
+} from "../src/database/messages.js";
+import {
+  getCustomerByName,
+  getCustomerBalance,
+  getAllOutstanding,
+} from "../src/database/customers.js";
 
 import { getDailySummary } from "../src/services/summary.service.js";
 import { getMonthlySummary } from "../src/services/monthly-summary.service.js";

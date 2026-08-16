@@ -18,16 +18,15 @@
 
 import "dotenv/config";
 
+import { pool } from "../src/database/pool.js";
+import { findOrCreateUser, setUserLanguage } from "../src/database/users.js";
 import {
-  pool,
-  findOrCreateUser,
-  setUserLanguage,
   createWorkspace,
   setActiveWorkspace,
   getActiveWorkspace,
-  createMessage,
-  finishOnboarding,
-} from "../src/database/postgres.js";
+} from "../src/database/workspaces.js";
+import { createMessage } from "../src/database/messages.js";
+import { finishOnboarding } from "../src/database/onboarding.js";
 
 import { LANGUAGES } from "../src/i18n/index.js";
 

@@ -4,21 +4,24 @@
 
 import "dotenv/config";
 
+import { pool } from "../src/database/pool.js";
+import { findOrCreateUser } from "../src/database/users.js";
+import { createWorkspace, setActiveWorkspace } from "../src/database/workspaces.js";
 import {
-  pool,
-  findOrCreateUser,
+  confirmMessageTransaction,
+  getTransactionsByDate,
+} from "../src/database/transactions.js";
+import {
   createMessage,
   updateMessageStatus,
   updateMessageTransactionData,
-  confirmMessageTransaction,
+} from "../src/database/messages.js";
+import {
   getCustomerByName,
   getCustomerBalance,
   getCustomerTransactions,
   getAllOutstanding,
-  getTransactionsByDate,
-  createWorkspace,
-  setActiveWorkspace,
-} from "../src/database/postgres.js";
+} from "../src/database/customers.js";
 
 const A_TG = 999000001;
 const B_TG = 999000002;

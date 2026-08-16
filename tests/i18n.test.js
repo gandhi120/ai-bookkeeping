@@ -11,7 +11,7 @@
 // No database and no API key needed — pure data.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 import {
   LANGUAGES,
@@ -285,12 +285,25 @@ check("formatDate uses long month names", () => {
   assert.doesNotMatch(formatDate("hi", AUG), /॰/);
 });
 
-console.log("\ni18n: bot.js wiring\n");
+console.log("\ni18n: telegram wiring\n");
 
-const BOT = readFileSync(
-  new URL("../src/telegram/bot.js", import.meta.url),
-  "utf8"
-);
+// EVERY file in src/telegram/, not just bot.js.
+//
+// These two checks read the handlers as text. When bot.js was one file that
+// meant one readFileSync; now that it is eight, reading only the entry point
+// would leave both checks passing while covering ~100 lines of boot code and
+// none of the handlers they exist to guard. A test that quietly stops testing
+// is worse than no test, so this globs the directory — a ninth file is covered
+// the day it is added, with no edit here.
+const TELEGRAM = new URL("../src/telegram/", import.meta.url);
+
+const BOT_FILES = readdirSync(TELEGRAM)
+  .filter((name) => name.endsWith(".js"))
+  .sort()
+  .map((name) => ({
+    name,
+    src: readFileSync(new URL(name, TELEGRAM), "utf8"),
+  }));
 
 // THE BUG THIS EXISTS FOR. `user` is resolved inside a handler's try block, so
 // a catch block that calls translator(user) throws ReferenceError — and an
@@ -300,26 +313,28 @@ const BOT = readFileSync(
 // Catch blocks must use the hoisted `language` (via sendError or t()), never
 // `user`. Crude brace matching is enough here: these are all shallow blocks
 // and a false positive is a one-line fix, not a mystery.
-check("no catch block in bot.js references `user`", () => {
+check("no catch block in src/telegram/ references `user`", () => {
   const offenders = [];
 
-  for (const match of BOT.matchAll(/\}\s*catch\s*\(\w+\)\s*\{/g)) {
-    let depth = 1;
-    let i = match.index + match[0].length;
+  for (const { name, src: BOT } of BOT_FILES) {
+    for (const match of BOT.matchAll(/\}\s*catch\s*\(\w+\)\s*\{/g)) {
+      let depth = 1;
+      let i = match.index + match[0].length;
 
-    while (i < BOT.length && depth > 0) {
-      if (BOT[i] === "{") depth++;
-      else if (BOT[i] === "}") depth--;
-      i++;
+      while (i < BOT.length && depth > 0) {
+        if (BOT[i] === "{") depth++;
+        else if (BOT[i] === "}") depth--;
+        i++;
+      }
+
+      const body = BOT.slice(match.index + match[0].length, i);
+      const line = BOT.slice(0, match.index).split("\n").length;
+
+      // console.error(...) is fine — it never runs user-facing code.
+      const withoutLogs = body.replace(/console\.\w+\([^;]*\);/g, "");
+
+      if (/\buser\b/.test(withoutLogs)) offenders.push(`${name}:${line}`);
     }
-
-    const body = BOT.slice(match.index + match[0].length, i);
-    const line = BOT.slice(0, match.index).split("\n").length;
-
-    // console.error(...) is fine — it never runs user-facing code.
-    const withoutLogs = body.replace(/console\.\w+\([^;]*\);/g, "");
-
-    if (/\buser\b/.test(withoutLogs)) offenders.push(`bot.js:${line}`);
   }
 
   assert.deepEqual(
@@ -329,10 +344,13 @@ check("no catch block in bot.js references `user`", () => {
   );
 });
 
-// Every key bot.js asks for must exist, or the user gets the key printed back.
-check("every t()/tr() key used in bot.js exists in the catalog", () => {
+// Every key the handlers ask for must exist, or the user gets the key printed
+// back at them.
+check("every t()/tr() key used in src/telegram/ exists in the catalog", () => {
   const used = new Set(
-    [...BOT.matchAll(/\b(?:tr|t)\(\s*(?:[\w.]+,\s*)?["']([a-z]+\.[A-Za-z_]+)["']/g)]
+    BOT_FILES.flatMap(({ src }) => [
+      ...src.matchAll(/\b(?:tr|t)\(\s*(?:[\w.]+,\s*)?["']([a-z]+\.[A-Za-z_]+)["']/g),
+    ])
       .map((match) => match[1])
       // type.* and cat.* are built at runtime by enumLabel from the enums,
       // and those are covered by the checks above.

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Telegram bot that turns natural-language messages ("Bought a laptop for ₹50,000") into bookkeeping transactions. Groq (llama-3.3-70b-versatile) extracts structured JSON from the message, Zod validates it, the user confirms via inline Telegram buttons, and the confirmed transaction is stored in PostgreSQL.
 
-`ARCHITECTURE.md` is the long-form version of this file: every table, every relationship, the reasoning behind each design decision, with worked examples and annotated code. This file stays short; that one teaches.
+`ARCHITECTURE.md` is the index to `docs/` — the long-form version of this file, split into 14 pages: every table, every relationship, the reasoning behind each design decision, with worked examples and annotated code. This file stays short; those teach. Start at `docs/01-what-it-is.md`, or jump straight to `docs/09-code-map.md` for which file holds what.
 
 `FUTURE_FEATURES.md` is the roadmap from bookkeeping to business intelligence — product catalog → inventory → analytics → AI insights — with what each layer needs and why the order cannot be changed.
 
@@ -58,9 +58,9 @@ development needs no ngrok and no code change.
   sit there looking healthy.
 ## Running in production
 
-- **Importing `bot.js` does nothing.** The constructor is passed
-  `polling: false` / `autoOpen: false`, and `start()` at the bottom runs only
-  when `import.meta.url` matches `process.argv[1]`. That is what lets
+- **Importing `bot.js` does nothing.** The constructor (in `telegram/core.js`)
+  is passed `polling: false` / `autoOpen: false`, and `start()` in `bot.js` runs
+  only when `import.meta.url` matches `process.argv[1]`. That is what lets
   `tests/ratelimit.test.js` import the module without the bot going live, and
   it is the hook `server.js` would use if HTTP ever comes back for WhatsApp.
 - **`start()` checks the env vars first and exits 1 on any missing.** The list
@@ -74,7 +74,7 @@ development needs no ngrok and no code change.
   deploy commits instead of being severed mid-`BEGIN`. Data is safe either way;
   this is about the user not seeing a spurious failure.
 - **The flood guard sits in front of the AI, not the database.** `overRateLimit`
-  in `bot.js` allows 20 free-text messages per user per minute. The budget it
+  in `telegram/messages.js` allows 20 free-text messages per user per minute. The budget it
   protects is shared and daily, so one person pasting a hundred lines does not
   inconvenience themselves — it takes the shop down until tomorrow. Commands
   skip it because they are pure reads. It replies only on the message that
@@ -87,12 +87,23 @@ development needs no ngrok and no code change.
 
 ES modules throughout (`"type": "module"`). Flow for an incoming message:
 
-1. **`src/telegram/bot.js`** — all Telegram handling: slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`, `/udhaar`, `/workspace`, `/language`), free-text message handler, and the `callback_query` handler (confirm/cancel, payment clarification, workspace switching, language selection). This is the orchestrator. `resolveShopkeeper()` is the single chokepoint that resolves both the user and their active workspace — the language rides along on the same `users` row, so reading it costs nothing extra.
+1. **`src/telegram/`** — all Telegram handling, split into eight files by
+   responsibility: `core.js` (the `bot` instance, `resolveShopkeeper()`, the
+   setup gate, `money`/`today`/`sendError`), `cards.js` (rendering +
+   `askToConfirm()`), `commands.js`, `khata.js`, `messages.js` (flood guard +
+   free text), `onboarding.js`, `callbacks.js`, and `bot.js` (boot/shutdown
+   only). **`core.js` imports nothing from its siblings** — that is what keeps
+   the graph acyclic; handlers register as an import side effect, so import
+   order in `bot.js` is registration order. Slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`, `/udhaar`, `/workspace`, `/language`), free-text message handler, and the `callback_query` handler (confirm/cancel, payment clarification, workspace switching, language selection). This is the orchestrator. `resolveShopkeeper()` is the single chokepoint that resolves both the user and their active workspace — the language rides along on the same `users` row, so reading it costs nothing extra.
 2. **`src/services/transaction.service.js`** — `processMessage(text, telegramMessageId, workspaceType, language)`: asks the AI, `JSON.parse`s the reply, validates with `MessageSchema` (Zod), enforces the workspace type guard, attaches the Telegram message ID. Does not touch the database.
 3. **`src/ai/groq.service.js`** — exports `askAI(message, workspaceType, language)`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`llama-3.3-70b-versatile`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt(workspaceType, language)` — both providers share it, so they cannot drift — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
 
    Model IDs are pinned deliberately — never use Gemini's `-latest` aliases, which Google repoints without warning, and note that Google *retires* models outright (`gemini-2.0-flash` now 404s).
-4. **`src/database/postgres.js`** — all SQL lives here (pg `Pool`, raw queries). No ORM. Schema changes live in `migrations/` as numbered `.sql` files, wrapped in one `BEGIN`/`COMMIT` with commented rollback at the bottom. They are **never run automatically** — review and apply them by hand. The `users`, `messages` and `transactions` tables predate the repo and have no `CREATE TABLE` on disk.
+4. **`src/database/`** — all SQL lives here (pg `Pool`, raw queries), one file
+   per concern: `pool.js` (imports nothing local, so `pool` stays a singleton and
+   `pool.end()` drains what every query uses), `users.js`, `workspaces.js`,
+   `transactions.js` (incl. `confirmMessageTransaction()`), `messages.js`,
+   `customers.js`, `onboarding.js`. No ORM. Schema changes live in `migrations/` as numbered `.sql` files, wrapped in one `BEGIN`/`COMMIT` with commented rollback at the bottom. They are **never run automatically** — review and apply them by hand. The `users`, `messages` and `transactions` tables predate the repo and have no `CREATE TABLE` on disk.
 5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — `summarize(rows, workspaceType)` lives in the first and is imported by the second, so a new transaction type is only added in one place.
 
 ## Workspaces
@@ -261,7 +272,7 @@ zero.
 ## Key design points
 
 - **Confirmation flow is database-backed, not in-memory.** An incoming message is saved to the `messages` table and moved through a status lifecycle: `RECEIVED → PROCESSING → PENDING_CONFIRMATION → CONFIRMED | CANCELLED | FAILED`. The AI-extracted entries are stored as JSONB in `messages.transaction_data` while awaiting confirmation. Callback data on the buttons is just `confirm:<telegram_message_id>` / `cancel:<telegram_message_id>`; everything else is looked up in Postgres.
-- **Confirmation is atomic and race-safe:** `confirmMessageTransaction()` in `postgres.js` uses `BEGIN` + `SELECT ... FOR UPDATE` to lock the message row, inserts the transactions, and marks the message `CONFIRMED` in one transaction. It returns `{success, reason}` objects (`NOT_FOUND`, `ALREADY_PROCESSED`, `TRANSACTION_DATA_MISSING`) rather than throwing for expected failures. There is no separate `createTransaction` — the INSERT inside this function is the only place transaction rows are created.
+- **Confirmation is atomic and race-safe:** `confirmMessageTransaction()` in `database/transactions.js` uses `BEGIN` + `SELECT ... FOR UPDATE` to lock the message row, inserts the transactions, and marks the message `CONFIRMED` in one transaction. It returns `{success, reason}` objects (`NOT_FOUND`, `ALREADY_PROCESSED`, `TRANSACTION_DATA_MISSING`) rather than throwing for expected failures. There is no separate `createTransaction` — the INSERT inside this function is the only place transaction rows are created.
 - **Idempotency via upserts:** `findOrCreateUser` upserts on `telegram_user_id`; `createMessage` uses `ON CONFLICT ... DO NOTHING` on `(user_id, telegram_message_id)`, and the transaction insert on `(user_id, telegram_message_id, seq)`.
 - **All dates/times use the `Asia/Kolkata` timezone** and amounts are displayed in ₹ (INR). `today()` formats with `toLocaleDateString("en-CA")` to get the `YYYY-MM-DD` string SQL takes as `::date` — that is a machine format and must never be sent to a user; `formatDate()` in `src/i18n/` is what the user sees.
 

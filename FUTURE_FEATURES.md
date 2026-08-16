@@ -41,7 +41,7 @@ do about it.**
   "What happened?" "What's next?" "What should I do?"
 ```
 
-**Read `ARCHITECTURE.md` first.** This document assumes you know the five
+**Read [ARCHITECTURE.md](ARCHITECTURE.md) first** — it indexes `docs/`. This document assumes you know the five
 tables, the workspace rule, and the confirmation flow.
 
 ---
@@ -130,7 +130,7 @@ The properties worth stealing:
 - **`UNIQUE (user_id, lower(name))`** — case-insensitive, scoped per user.
 - **`findOrCreateCustomer(client, …)` takes the caller's `client`**, so the
   product is created inside the same atomic confirmation as the transaction
-  (`ARCHITECTURE.md` §6.3).
+  ([the confirmation flow](docs/05-confirmation.md)).
 
 ### Proposed schema
 
@@ -160,7 +160,7 @@ CREATE INDEX transactions_product_idx
 Three decisions in there worth defending:
 
 **`workspace_id`, not just `user_id`.** Note this differs from `customers`,
-which is scoped by user only — a known ceiling in `ARCHITECTURE.md` §15. Do not
+which is scoped by user only — a known ceiling in [known limits](docs/12-limits.md). Do not
 repeat it. The shop's "rice" stock and a household "rice" grocery line are not
 the same thing, and the unique index must not merge them.
 
@@ -169,7 +169,7 @@ it per-transaction invites "5 kg" and "5 packets" of the same product, which
 makes stock arithmetic meaningless.
 
 **`product_id` is nullable.** Same reasoning as `customer_id`
-(`ARCHITECTURE.md` §3.5): an electricity bill has no product, and NULL is the
+([the tables](docs/02-tables.md)): an electricity bill has no product, and NULL is the
 correct representation of that. It also means **every existing row stays valid**
 — this migration is purely additive, exactly like `001`–`003`.
 
@@ -216,7 +216,7 @@ product `shirt`.
 
 **Do not do this in the prompt.** Asking the model to pick from a list means
 sending the shopkeeper's entire catalog with every message — and the system
-prompt is already the binding cost (`ARCHITECTURE.md` §8.3). A shop with 300
+prompt is already the binding cost ([the AI boundary](docs/06-ai-boundary.md)). A shop with 300
 products would pay for all 300 on every "paid electricity bill".
 
 Instead, extract a product **name** and resolve it in code:
@@ -266,7 +266,7 @@ being **movement**.
 **Two rows in that table are the whole design, and both are easy to get wrong.**
 
 **`credit_sale` moves stock.** The goods physically left the shop; only the
-money is outstanding. This is the same insight as `ARCHITECTURE.md` §9.3, where
+money is outstanding. This is the same insight as [the khata](docs/07-khata.md), where
 `credit_sale` counts as revenue immediately.
 
 **`repayment` moves nothing.** No goods change hands — it is cash against an old
@@ -278,7 +278,7 @@ same rule, applied to different units.
 
 ### Where this lives in code
 
-Do **not** scatter these rules through `bot.js`. They belong beside the existing
+Do **not** scatter these rules through `src/telegram/`. They belong beside the existing
 type rules in `src/schemas/transaction.schema.js`, which is already the single
 place that answers "what does this type mean?":
 
@@ -311,7 +311,7 @@ This is the most important decision in the whole roadmap, and the codebase has
 already made it once.
 
 `customers` has **no `balance` column.** The outstanding amount is a
-`SUM(CASE …)` recomputed on every read (`ARCHITECTURE.md` §9.1). The reasoning:
+`SUM(CASE …)` recomputed on every read ([the khata](docs/07-khata.md)). The reasoning:
 
 > A stored `balance` column is faster to read and **wrong the first time
 > anything goes sideways.** A sum recomputed from the rows cannot lie.
@@ -377,7 +377,7 @@ went unrecorded. That is exactly the kind of thing the shopkeeper needs told:
 ```
 
 Same principle as the negative customer balance rendering as "paid in advance"
-(`ARCHITECTURE.md` §9.2): a surprising number is a fact about reality, not a bug
+([the khata](docs/07-khata.md)): a surprising number is a fact about reality, not a bug
 to hide.
 
 ---
@@ -419,7 +419,7 @@ AND transaction_date >= $from
 AND transaction_date <  $to
 ```
 
-`>= from AND < to`, never `BETWEEN`. `ARCHITECTURE.md` §12.3 explains why.
+`>= from AND < to`, never `BETWEEN`. [the code map](docs/09-code-map.md) explains why.
 
 ### The three analytics, and what each needs
 
@@ -543,7 +543,7 @@ Non-negotiables:
   wedding order, a supplier problem — and reasoning lets them overrule you
   intelligently.
 - **Never act automatically.** No auto-ordering, ever. The confirm/cancel
-  pattern (`ARCHITECTURE.md` §6) is the existing answer to "the machine
+  pattern ([the confirmation flow](docs/05-confirmation.md)) is the existing answer to "the machine
   proposes, the human decides" — extend it, do not bypass it.
 - **Fewer, better.** Three good recommendations a week beat twenty daily. Twenty
   daily is noise, and noise gets muted.
@@ -555,7 +555,7 @@ Not in computing any of the above. In **two** places:
 1. **Natural-language questions over the data.** "How much rice did I sell last
    month?" → the model turns that into a *parameterised call to an existing
    analytics function*, not into raw SQL it invents. The whitelist pattern from
-   `CLARIFIED_TYPE` (`ARCHITECTURE.md` §10.4) applies exactly: the model picks
+   `CLARIFIED_TYPE` ([the khata](docs/07-khata.md)) applies exactly: the model picks
    from known functions, never writes the query.
 2. **Phrasing.** Turning a computed result into a sentence in the shopkeeper's
    language — which the existing multilingual prompt work already handles well.
@@ -590,7 +590,7 @@ Honest accounting of what has to change, and what does not.
 
 ### The ceilings this collides with
 
-From `ARCHITECTURE.md` §15, the ones this roadmap actually walks into:
+From [known limits](docs/12-limits.md), the ones this roadmap actually walks into:
 
 - **`customers` has no `workspace_id`.** Give `products` one from day one. Do
   not copy the mistake.
@@ -599,8 +599,10 @@ From `ARCHITECTURE.md` §15, the ones this roadmap actually walks into:
   *before* building reports on top, not after.
 - **`transactions.telegram_message_id` is `text`, `messages` is `bigint`.** More
   joins are coming. Fix it in its own migration first.
-- **`bot.js` has no direct tests** — and it is 1,779 lines. Every phase here
-  adds handlers. This is the point at which that ceiling stops being
+- **The Telegram handlers have no direct tests.** `bot.js` was split into eight
+  files in `src/telegram/`, which makes `cards.js` (pure renderers — plain
+  objects in, strings out) cheap to test for the first time. Every phase here
+  adds handlers, so this is the point at which that ceiling stops being
   theoretical.
 
 ---

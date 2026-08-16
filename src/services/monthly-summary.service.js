@@ -1,4 +1,4 @@
-import { getTransactionsByMonth } from "../database/postgres.js";
+import { getTransactionsByMonth } from "../database/transactions.js";
 import { summarize } from "./summary.service.js";
 
 // Creates a financial summary for one workspace over a whole month.

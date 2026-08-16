@@ -1,4 +1,4 @@
-import { getTransactionsByDate } from "../database/postgres.js";
+import { getTransactionsByDate } from "../database/transactions.js";
 
 // Adds up a list of transactions.
 //
