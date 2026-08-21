@@ -52,9 +52,14 @@ async function answerBalanceQuery(chatId, user, personName) {
     return;
   }
 
+  // The sign IS the answer: positive means they owe the user, negative means
+  // the user owes them. One number, both directions — which is what lets a
+  // person you both lend to and borrow from be a single khata.
   await bot.sendMessage(
     chatId,
-    tr("khata.owesYou", { person: customer.name, amount: money(balance) })
+    balance < 0
+      ? tr("khata.youOwe", { person: customer.name, amount: money(-balance) })
+      : tr("khata.owesYou", { person: customer.name, amount: money(balance) })
   );
 }
 
@@ -84,8 +89,10 @@ async function answerHistoryQuery(chatId, user, personName) {
   const list = transactions
     .map((transaction) => {
       // Show the direction of each entry so the running total makes sense.
-      const sign =
-        transaction.transaction_type === "credit_sale" ? "＋" : "－";
+      // Read off owed_delta, the generated column — so this cannot disagree
+      // with the balance printed underneath it, which is a SUM of the same
+      // column. It used to re-derive the sign from transaction_type here.
+      const sign = Number(transaction.owed_delta) >= 0 ? "＋" : "－";
 
       // No year: every row is the same khata and the year is noise.
       const date = formatDate(user.language, transaction.transaction_date, {

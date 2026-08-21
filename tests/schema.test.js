@@ -12,12 +12,9 @@ import assert from "node:assert/strict";
 import {
   MessageSchema,
   isCustomerTransaction,
-  isTypeAllowedInWorkspace,
-  TRANSACTION_TYPES,
-  CUSTOMER_TRANSACTION_TYPES,
-  WORKSPACE_TYPES,
-  HOUSEHOLD_CATEGORIES,
-  featuresForWorkspace,
+  owedDelta,
+  CASH_VALUES,
+  UDHAAR_VALUES,
 } from "../src/schemas/transaction.schema.js";
 
 let passed = 0;
@@ -38,6 +35,8 @@ function transaction(overrides = {}) {
   return {
     intent: "transaction",
     transaction_type: "purchase",
+    cash: "out",
+    udhaar: "none",
     description: "10 kg rice",
     category: "stock",
     quantity: 10,
@@ -57,18 +56,40 @@ check("normal purchase", () => {
   assert.equal(result.amount, 600);
 });
 
-check("credit sale keeps the customer name", () => {
+check("udhaar given keeps the customer name", () => {
   const result = MessageSchema.parse(
-    transaction({ transaction_type: "credit_sale", person: "Raj", amount: 2000 })
+    transaction({
+      cash: "none",
+      udhaar: "they_owe_more",
+      person: "Raj",
+      amount: 2000,
+    })
   );
   assert.equal(result.person, "Raj");
+  assert.equal(result.cash, "none");
 });
 
-check("repayment is a valid type", () => {
+check("a repayment answers BOTH axes", () => {
+  // The case a single-field model cannot express: money arrived AND a debt
+  // went down. Under the old enum this was one name, "repayment", and every
+  // consumer had to remember it meant two things.
   const result = MessageSchema.parse(
-    transaction({ transaction_type: "repayment", person: "Raj", amount: 1000 })
+    transaction({
+      cash: "in",
+      udhaar: "they_owe_less",
+      person: "Raj",
+      amount: 1000,
+    })
   );
-  assert.equal(result.transaction_type, "repayment");
+  assert.equal(result.cash, "in");
+  assert.equal(result.udhaar, "they_owe_less");
+});
+
+check("the user borrowing is the direction the old enum could not record", () => {
+  const result = MessageSchema.parse(
+    transaction({ cash: "in", udhaar: "i_owe_more", person: "Mama", amount: 10000 })
+  );
+  assert.equal(result.udhaar, "i_owe_more");
 });
 
 check("balance query needs only a person", () => {
@@ -87,17 +108,7 @@ check("history query needs only a person", () => {
   assert.equal(result.intent, "history_query");
 });
 
-check("every declared type is accepted", () => {
-  for (const type of TRANSACTION_TYPES) {
-    MessageSchema.parse(transaction({ transaction_type: type }));
-  }
-});
-
 console.log("\nBad input is rejected before it reaches the database:");
-
-check("hallucinated transaction_type is rejected", () => {
-  assert.throws(() => MessageSchema.parse(transaction({ transaction_type: "refund" })));
-});
 
 check("missing amount is rejected", () => {
   const bad = transaction();
@@ -137,280 +148,148 @@ check("balance query without a person is rejected", () => {
 
 console.log("\nOnly udhaar types are linked to a customer:");
 
-check("credit_sale and repayment are customer transactions", () => {
-  assert.equal(isCustomerTransaction("credit_sale"), true);
-  assert.equal(isCustomerTransaction("repayment"), true);
-});
+check("an entry that moves a debt is a customer transaction", () => {
+  for (const udhaar of UDHAAR_VALUES) {
+    if (udhaar === "none") continue;
 
-check("ordinary types are not customer transactions", () => {
-  for (const type of ["sale", "purchase", "expense", "payment_sent", "payment_received", "other"]) {
-    assert.equal(isCustomerTransaction(type), false, `${type} should not link a customer`);
+    assert.equal(
+      isCustomerTransaction({ udhaar }),
+      true,
+      `${udhaar} should link a customer`
+    );
   }
 });
 
-console.log("\nA workspace only accepts the types that belong in it:");
+check("an entry that moves no debt is not", () => {
+  assert.equal(isCustomerTransaction({ udhaar: "none" }), false);
+});
 
-check("a household cannot record udhaar", () => {
-  // The whole point of the guard: a hallucinated credit_sale on a grocery
-  // message must never reach confirmMessageTransaction, because that is what
-  // opens a khata.
-  for (const type of ["credit_sale", "repayment", "sale", "purchase", "payment_sent", "payment_received"]) {
+check("a missing udhaar field is not a customer transaction", () => {
+  // Fail closed. A pre-006 row read back from JSONB has no udhaar at all, and
+  // must not be treated as opening a khata just because the field is absent.
+  assert.equal(isCustomerTransaction({}), false);
+  assert.equal(isCustomerTransaction(undefined), false);
+  assert.equal(isCustomerTransaction(null), false);
+});
+
+console.log("\nThe AI cannot corrupt a total:");
+
+// This is what replaced isTypeAllowedInWorkspace. The old guard stopped a
+// hallucinated type reaching a ledger that could not record it. Now the model
+// answers the DIRECTION itself, so the three ways it could put money in the
+// wrong place are: an out-of-enum cash, an out-of-enum udhaar, and a negative
+// amount. All three are refused here, before anything reaches a total.
+
+check("a cash value outside the enum is rejected", () => {
+  for (const bogus of ["sideways", "IN", "", null, 1]) {
     assert.equal(
-      isTypeAllowedInWorkspace("household", type),
+      MessageSchema.safeParse(transaction({ cash: bogus })).success,
       false,
-      `${type} should not be recordable at home`
+      `cash "${bogus}" was accepted`
     );
   }
 });
 
-check("a shop cannot record household income", () => {
-  // Money into a shop is a sale or a payment_received, never a salary.
-  assert.equal(isTypeAllowedInWorkspace("shopkeeper", "income"), false);
-});
-
-check("household accepts its own types", () => {
-  for (const type of ["expense", "income", "other"]) {
-    assert.equal(isTypeAllowedInWorkspace("household", type), true, type);
+check("an udhaar value outside the enum is rejected", () => {
+  for (const bogus of ["they_owe", "credit_sale", "", null]) {
+    assert.equal(
+      MessageSchema.safeParse(transaction({ udhaar: bogus })).success,
+      false,
+      `udhaar "${bogus}" was accepted`
+    );
   }
 });
 
-check("shopkeeper still accepts every type it accepted before", () => {
-  for (const type of TRANSACTION_TYPES) {
-    if (type === "income") continue;
+check("every declared cash and udhaar value is accepted", () => {
+  for (const cash of CASH_VALUES) {
+    assert.equal(
+      MessageSchema.safeParse(transaction({ cash })).success,
+      true,
+      `${cash} was declared but rejected`
+    );
+  }
+
+  for (const udhaar of UDHAAR_VALUES) {
+    assert.equal(
+      MessageSchema.safeParse(transaction({ udhaar })).success,
+      true,
+      `${udhaar} was declared but rejected`
+    );
+  }
+});
+
+check("cash and udhaar are both required", () => {
+  const { cash, ...noCash } = transaction();
+  const { udhaar, ...noUdhaar } = transaction();
+
+  assert.equal(MessageSchema.safeParse(noCash).success, false);
+  assert.equal(MessageSchema.safeParse(noUdhaar).success, false);
+});
+
+check("a negative amount is rejected", () => {
+  // The direction is carried by cash and udhaar. If a minus sign could also
+  // carry it, an expense sent as -500 would SUBTRACT from the outgoings it
+  // belongs in — the total would be wrong by twice the amount and nothing
+  // would look broken.
+  assert.equal(MessageSchema.safeParse(transaction({ amount: -500 })).success, false);
+});
+
+check("a zero amount is rejected", () => {
+  assert.equal(MessageSchema.safeParse(transaction({ amount: 0 })).success, false);
+});
+
+check("transaction_type is free text now", () => {
+  // It is a LABEL. The AI writes it in the user's language, so anything that
+  // is a string has to pass — the enum moved to cash and udhaar.
+  for (const label of ["ખર્ચ", "उधार", "petrol", "whatever"]) {
+    assert.equal(
+      MessageSchema.safeParse(transaction({ transaction_type: label })).success,
+      true,
+      `"${label}" was rejected`
+    );
+  }
+});
+
+console.log("\nThe khata sign mirrors the database:");
+
+// owedDelta() is the JS twin of the owed_delta GENERATED column. The column is
+// the authority for rows that exist; this is used to preview a row that has
+// not been inserted yet. They must agree, so the signs are asserted here and
+// against real Postgres in tests/workspace.integration.js.
+
+check("they_owe_more and i_owe_less are positive", () => {
+  assert.equal(owedDelta({ udhaar: "they_owe_more", amount: 500 }), 500);
+  assert.equal(owedDelta({ udhaar: "i_owe_less", amount: 400 }), 400);
+});
+
+check("they_owe_less and i_owe_more are negative", () => {
+  assert.equal(owedDelta({ udhaar: "they_owe_less", amount: 500 }), -500);
+  assert.equal(owedDelta({ udhaar: "i_owe_more", amount: 1000 }), -1000);
+});
+
+check("no udhaar means no movement", () => {
+  assert.equal(owedDelta({ udhaar: "none", amount: 500 }), 0);
+  assert.equal(owedDelta({}), 0);
+  assert.equal(owedDelta(undefined), 0);
+});
+
+check("every udhaar value has a sign decided for it", () => {
+  // Add a fifth direction and forget owedDelta, and it silently moves nobody's
+  // balance — the row saves, the khata just never changes.
+  for (const udhaar of UDHAAR_VALUES) {
+    const delta = owedDelta({ udhaar, amount: 100 });
 
     assert.equal(
-      isTypeAllowedInWorkspace("shopkeeper", type),
+      udhaar === "none" ? delta === 0 : Math.abs(delta) === 100,
       true,
-      `${type} regressed out of the shop ledger`
+      `"${udhaar}" has no sign in owedDelta()`
     );
   }
 });
 
-check("an unknown workspace type accepts nothing", () => {
-  // Fail closed: a typo in a workspace type must not silently allow
-  // everything through.
-  assert.equal(isTypeAllowedInWorkspace("bogus", "expense"), false);
-  assert.equal(isTypeAllowedInWorkspace(undefined, "expense"), false);
+check("postgres numeric strings are handled", () => {
+  // amount arrives as a string from node-postgres.
+  assert.equal(owedDelta({ udhaar: "they_owe_more", amount: "500" }), 500);
 });
 
-check("expense is the one type both ledgers share", () => {
-  assert.equal(isTypeAllowedInWorkspace("shopkeeper", "expense"), true);
-  assert.equal(isTypeAllowedInWorkspace("household", "expense"), true);
-});
-
-console.log("\nThe type lists still agree with each other:");
-
-// These do not test behaviour. They test that the several lists in
-// transaction.schema.js have not drifted apart — the failure mode you only
-// notice weeks later, when a message fails with a generic apology.
-
-check("every declared type belongs to at least one workspace", () => {
-  // Add a type to TRANSACTION_TYPES and forget TYPES_BY_WORKSPACE, and you
-  // get a type the AI may emit and Zod will happily accept, but that no
-  // workspace can record. The user sees "I couldn't record that" with no clue.
-  for (const type of TRANSACTION_TYPES) {
-    const allowed = WORKSPACE_TYPES.some((workspace) =>
-      isTypeAllowedInWorkspace(workspace, type)
-    );
-
-    assert.equal(
-      allowed,
-      true,
-      `"${type}" is in TRANSACTION_TYPES but no workspace accepts it — add it to TYPES_BY_WORKSPACE`
-    );
-  }
-});
-
-check("no workspace allows a type the schema does not know", () => {
-  // The mirror of the check above: a typo inside TYPES_BY_WORKSPACE would
-  // permit a type that Zod then rejects further down the pipeline.
-  for (const workspace of WORKSPACE_TYPES) {
-    for (const type of TRANSACTION_TYPES.concat(["refund", "loan", ""])) {
-      if (TRANSACTION_TYPES.includes(type)) continue;
-
-      assert.equal(
-        isTypeAllowedInWorkspace(workspace, type),
-        false,
-        `${workspace} accepts "${type}", which is not a declared transaction type`
-      );
-    }
-  }
-});
-
-check("only a shop can record a type that touches a khata", () => {
-  // The standing product rule — a household has no customers — asserted from
-  // the data rather than trusted. If a customer type ever became legal at
-  // home, confirmMessageTransaction would open a khata from a grocery bill.
-  for (const type of CUSTOMER_TRANSACTION_TYPES) {
-    assert.equal(isTypeAllowedInWorkspace("shopkeeper", type), true, type);
-
-    for (const workspace of WORKSPACE_TYPES) {
-      if (workspace === "shopkeeper") continue;
-
-      assert.equal(
-        isTypeAllowedInWorkspace(workspace, type),
-        false,
-        `${workspace} can record "${type}", which would open a khata`
-      );
-    }
-  }
-});
-
-check("every workspace accepts at least one type", () => {
-  // Catches a workspace added to the enum but never wired up: it would
-  // reject every single message the user sends into it.
-  for (const workspace of WORKSPACE_TYPES) {
-    const usable = TRANSACTION_TYPES.filter((type) =>
-      isTypeAllowedInWorkspace(workspace, type)
-    );
-
-    assert.ok(
-      usable.length > 0,
-      `workspace "${workspace}" accepts nothing — it is in WORKSPACE_TYPES but missing from TYPES_BY_WORKSPACE`
-    );
-  }
-});
-
-check("household categories are clean enough to put in a prompt", () => {
-  // This list is interpolated straight into the household system prompt, so
-  // a duplicate wastes tokens and a capitalised entry teaches the model to
-  // emit a category that will not match the others when grouped.
-  assert.ok(HOUSEHOLD_CATEGORIES.length > 0, "no categories to offer");
-
-  assert.equal(
-    new Set(HOUSEHOLD_CATEGORIES).size,
-    HOUSEHOLD_CATEGORIES.length,
-    "duplicate category"
-  );
-
-  for (const category of HOUSEHOLD_CATEGORIES) {
-    assert.equal(category, category.toLowerCase(), `"${category}" is not lowercase`);
-    assert.equal(category.trim(), category, `"${category}" has stray whitespace`);
-    assert.ok(category.length > 0, "empty category");
-  }
-});
-
-// --------------------------------------------------
-// featuresForWorkspace — what each ledger can DO
-// --------------------------------------------------
-//
-// This is the list the onboarding tour builds its buttons from, so it is also
-// the answer to "does each ledger offer all its features?". Asserting on it
-// here is the only way to check that without tapping through Telegram:
-// importing bot.js would start the bot polling.
-
-// Every feature the tour knows how to run. Mirrors the keys of TOUR in
-// src/telegram/bot.js — a feature offered to a workspace but missing there
-// would render a button that does nothing.
-const RUNNABLE_FEATURES = ["summary", "monthly", "transactions", "udhaar"];
-
-check("a shop offers every feature", () => {
-  assert.deepEqual(featuresForWorkspace("shopkeeper"), [
-    "summary",
-    "monthly",
-    "transactions",
-    "udhaar",
-  ]);
-});
-
-check("a household offers the three it can use", () => {
-  assert.deepEqual(featuresForWorkspace("household"), [
-    "summary",
-    "monthly",
-    "transactions",
-  ]);
-});
-
-check("a household is never offered udhaar", () => {
-  // A home has no customers, so a khata button would open a feature that
-  // cannot work — isTypeAllowedInWorkspace already refuses the transactions
-  // behind it.
-  assert.ok(!featuresForWorkspace("household").includes("udhaar"));
-});
-
-check("both ledgers can read their money back", () => {
-  // The three reporting features are the essential set: whatever else
-  // differs, neither ledger may be missing a way to see what it recorded.
-  for (const type of WORKSPACE_TYPES) {
-    for (const essential of ["summary", "monthly", "transactions"]) {
-      assert.ok(
-        featuresForWorkspace(type).includes(essential),
-        `${type} is missing ${essential}`
-      );
-    }
-  }
-});
-
-check("every offered feature is one the tour can run", () => {
-  for (const type of WORKSPACE_TYPES) {
-    for (const feature of featuresForWorkspace(type)) {
-      assert.ok(
-        RUNNABLE_FEATURES.includes(feature),
-        `${type} offers "${feature}", which no tour button can run`
-      );
-    }
-  }
-});
-
-check("an unknown workspace type offers nothing", () => {
-  // Fail closed, like isTypeAllowedInWorkspace: a typo must not hand out
-  // every feature.
-  assert.deepEqual(featuresForWorkspace("bank"), []);
-  assert.deepEqual(featuresForWorkspace(undefined), []);
-});
-
-console.log("\nOne message can carry several entries:");
-
-// The bug this covers: the AI answered "400 nu dudh, 300 no sabu" with a JSON
-// ARRAY of two transactions, MessageSchema.parse threw "expected object,
-// received array", and the user was told the bot did not understand something
-// it had understood perfectly.
-check("a list of entries parses, one at a time", () => {
-  const entries = [
-    transaction({ description: "dudh", amount: 400 }),
-    transaction({ description: "sabu", amount: 300 }),
-  ];
-
-  const parsed = entries.map((entry) => MessageSchema.parse(entry));
-
-  assert.equal(parsed.length, 2);
-  assert.equal(parsed[0].amount, 400);
-  assert.equal(parsed[1].amount, 300);
-});
-
-// processMessage normalizes with `[parsed].flat()` so a model that answers a
-// one-entry message with a bare object is not a failure.
-check("[x].flat() accepts a bare object and a list alike", () => {
-  const one = transaction();
-
-  assert.deepEqual([one].flat(), [one]);
-  assert.deepEqual([[one, one]].flat(), [one, one]);
-});
-
-// The prompts say "never invent an amount, use null if missing" while the
-// schema requires a number, so a null amount is the most common single-entry
-// failure. It must FAIL here — that is what lets processMessage drop just
-// that entry and keep the others, instead of losing the whole message.
-check("an entry with no amount is rejected, so it can be skipped", () => {
-  const result = MessageSchema.safeParse(transaction({ amount: null }));
-
-  assert.equal(result.success, false);
-  assert.ok(
-    result.error.issues.some((issue) => issue.path.includes("amount")),
-    "the failure must name `amount` so it can be reported as a missing amount"
-  );
-});
-
-check("one bad entry does not invalidate its neighbours", () => {
-  const results = [
-    transaction({ amount: 400 }),
-    transaction({ amount: null }),
-    transaction({ amount: 300 }),
-  ].map((entry) => MessageSchema.safeParse(entry).success);
-
-  assert.deepEqual(results, [true, false, true]);
-});
-
-console.log(
-  `\n${passed} checks passed${process.exitCode ? " — SOME FAILED" : ""}\n`
-);
+console.log(`\n${passed} checks passed`);

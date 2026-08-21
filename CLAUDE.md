@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Telegram bot that turns natural-language messages ("Bought a laptop for ₹50,000") into bookkeeping transactions. Groq (llama-3.3-70b-versatile) extracts structured JSON from the message, Zod validates it, the user confirms via inline Telegram buttons, and the confirmed transaction is stored in PostgreSQL.
+A Telegram bot that turns natural-language messages ("Bought a laptop for ₹50,000") into bookkeeping transactions. Gemini (`gemini-3.1-flash-lite`), falling back to Groq (`openai/gpt-oss-120b`), extracts structured JSON from the message, Zod validates it, the user confirms via inline Telegram buttons, and the confirmed transaction is stored in PostgreSQL.
 
 `ARCHITECTURE.md` is the index to `docs/` — the long-form version of this file, split into 14 pages: every table, every relationship, the reasoning behind each design decision, with worked examples and annotated code. This file stays short; those teach. Start at `docs/01-what-it-is.md`, or jump straight to `docs/09-code-map.md` for which file holds what.
 
@@ -21,7 +21,7 @@ npm run dev      # same, with --watch
 grew its own webhook server — nothing imports either.
 
 ```bash
-npm test         # schema + summary + ratelimit + i18n. No DB, no API key, free.
+npm test         # schema + summary + ledger + ratelimit + i18n. No DB, no API key, free.
 npm run test:db  # tests/udhaar.integration.js — real Postgres. Needs DATABASE_URL.
 npm run test:ws  # tests/workspace.integration.js — workspace isolation. Needs DATABASE_URL.
 npm run test:onb # tests/onboarding.integration.js — onboarding + practice-data cleanup. Needs DATABASE_URL.
@@ -33,7 +33,7 @@ No linter is configured. Every integration suite creates throwaway users and del
 
 Required env vars (in `.env`, loaded via `dotenv/config`): `GROQ_API_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`.
 
-Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-3.1-flash-lite`.
+Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-3.1-flash-lite`, and `GROQ_MODEL` the default `openai/gpt-oss-120b`.
 
 ## Transport: polling vs webhook
 
@@ -94,33 +94,73 @@ ES modules throughout (`"type": "module"`). Flow for an incoming message:
    free text), `onboarding.js`, `callbacks.js`, and `bot.js` (boot/shutdown
    only). **`core.js` imports nothing from its siblings** — that is what keeps
    the graph acyclic; handlers register as an import side effect, so import
-   order in `bot.js` is registration order. Slash commands (`/start`, `/help`, `/summary`, `/transactions`, `/monthly`, `/udhaar`, `/workspace`, `/language`), free-text message handler, and the `callback_query` handler (confirm/cancel, payment clarification, workspace switching, language selection). This is the orchestrator. `resolveShopkeeper()` is the single chokepoint that resolves both the user and their active workspace — the language rides along on the same `users` row, so reading it costs nothing extra.
-2. **`src/services/transaction.service.js`** — `processMessage(text, telegramMessageId, workspaceType, language)`: asks the AI, `JSON.parse`s the reply, validates with `MessageSchema` (Zod), enforces the workspace type guard, attaches the Telegram message ID. Does not touch the database.
-3. **`src/ai/groq.service.js`** — exports `askAI(message, workspaceType, language)`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`llama-3.3-70b-versatile`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt(workspaceType, language)` — both providers share it, so they cannot drift — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
+   order in `bot.js` is registration order. Slash commands (`/start`, `/help`, `/menu`, `/summary`, `/transactions`, `/monthly`, `/udhaar`, `/workspace`, `/language`), free-text message handler, and the `callback_query` handler (confirm/cancel, payment clarification, ledger switching and creation, menu screens, language selection). This is the orchestrator. `resolveShopkeeper()` is the single chokepoint that resolves both the user and their active workspace — the language rides along on the same `users` row, so reading it costs nothing extra.
+2. **`src/services/transaction.service.js`** — `processMessage(text, telegramMessageId, language, ledgerName)`: asks the AI, `JSON.parse`s the reply, validates each entry with `MessageSchema` (Zod), attaches the Telegram message ID. Does not touch the database. There is no workspace type guard any more — there are no per-ledger rules left to enforce.
+3. **`src/ai/groq.service.js`** — exports `askAI(message, language, ledgerName)`, which tries **Gemini** (`gemini-3.1-flash-lite`) first and falls back to **Groq** (`openai/gpt-oss-120b`) on any failure. Gemini leads because its limit is per-minute (15 rpm, recovers in a minute) while Groq's is per-day (100k tokens, then the shop is down until tomorrow). Also holds `buildSystemPrompt(language, ledgerName)` — ONE prompt for every ledger now, and both providers share it so they cannot drift — and strips markdown fences from either response. Without `GEMINI_API_KEY` it calls Groq directly, exactly as before the fallback existed.
 
-   Model IDs are pinned deliberately — never use Gemini's `-latest` aliases, which Google repoints without warning, and note that Google *retires* models outright (`gemini-2.0-flash` now 404s).
+   Model IDs are pinned deliberately — never use `-latest` aliases, which get repointed without warning. Both providers also *retire* models outright: `gemini-2.0-flash` 404s, and so does `llama-3.3-70b-versatile`, which was Groq's pin until a `tests/ai.test.js` run caught it. Groq now runs `openai/gpt-oss-120b`, overridable with `GROQ_MODEL` exactly as `GEMINI_MODEL` overrides Gemini.
+
+   **The fallback needs testing on its own.** Gemini answers almost every message, so Groq is only reached when Gemini fails — which means a dead fallback looks identical to a working one for months. `GEMINI_API_KEY= node tests/ai.test.js` forces the Groq path.
 4. **`src/database/`** — all SQL lives here (pg `Pool`, raw queries), one file
    per concern: `pool.js` (imports nothing local, so `pool` stays a singleton and
    `pool.end()` drains what every query uses), `users.js`, `workspaces.js`,
    `transactions.js` (incl. `confirmMessageTransaction()`), `messages.js`,
    `customers.js`, `onboarding.js`. No ORM. Schema changes live in `migrations/` as numbered `.sql` files, wrapped in one `BEGIN`/`COMMIT` with commented rollback at the bottom. They are **never run automatically** — review and apply them by hand. The `users`, `messages` and `transactions` tables predate the repo and have no `CREATE TABLE` on disk.
-5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — `summarize(rows, workspaceType)` lives in the first and is imported by the second, so a new transaction type is only added in one place.
+5. **`src/services/summary.service.js` / `monthly-summary.service.js`** — `summarize(rows)` lives in the first and is imported by the second and by `getMonthlySummaryAll()`, so there is exactly one implementation of "what do these rows add up to".
 
-## Workspaces
+## Ledgers (the `workspaces` table)
 
-A user keeps one or more ledgers: a `shopkeeper` workspace, a `household` workspace, or both. `users.active_workspace_id` is the switcher state; `/workspace` shows it.
+A user keeps as many ledgers as they want, each one an **emoji and a name they
+typed**: 🏪 Kirana Store, 🏠 Ghar, 🏍️ Bike. `users.active_workspace_id` is the
+switcher state; `/menu` and `/workspace` show it.
 
-- **`workspace.type` drives everything downstream** — which system prompt `buildSystemPrompt()` returns, which transaction types `isTypeAllowedInWorkspace()` accepts, and how `/summary` and `/monthly` render.
-- **Two separate prompts, not one with a switch.** The prompt ships with every message, so a combined prompt would make every shop message pay for household rules it can never use. `buildShopkeeperPrompt()` is the original text, unchanged; `buildHouseholdPrompt()` is much shorter because a household has no khata.
-- **Isolation is by `workspace_id`, not `user_id`** — the same person owns both ledgers, so `user_id` alone would show the groceries inside the shop's `/summary`. Every transaction read filters on both.
-- **The workspace is stamped on the message at arrival and read back off the locked row at confirmation**, never from the user's current setting. Otherwise switching workspaces between typing and tapping Confirm would misfile the transaction.
-- **The AI is instructed, never trusted.** The prompt is told which types exist; `isTypeAllowedInWorkspace()` in `src/schemas/transaction.schema.js` is what actually enforces it, so a hallucinated `credit_sale` on a grocery message cannot open a khata.
-- `transactions.workspace_id` is deliberately nullable: rows predating `ebcb1a0` have no `user_id`, so they cannot be backfilled. They are invisible to every query either way — see `migrations/002_workspaces.sql`.
+Until `migrations/006_open_ledgers.sql` there were exactly two kinds, a
+`shopkeeper` and a `household`, and `workspaces.type` drove five things. It now
+drives nothing and is kept nullable for one release so a rollback needs no
+second migration — drop it in 007.
+
+- **Identity is the NAME.** `UNIQUE (user_id, lower(name))` replaced
+  `UNIQUE (user_id, type)`, which is what capped a user at two. `lower()` for
+  the same reason `customers_user_name_unique` uses it, and it keeps
+  "+ New ledger" idempotent against a double-tapped button.
+- **Creation is one message.** The user sends `🏍️ Bike`; `parseLedger()` in
+  `telegram/onboarding.js` splits it with `Intl.Segmenter`, which walks
+  *grapheme clusters* — a `\p{Extended_Pictographic}` regex returns `👨` from
+  `👨🏽‍🌾` and glues the rest to the name. Flags need `\p{Regional_Indicator}`
+  too, since 🇮🇳 is two of those and neither is pictographic.
+- **`users.pending_action`** is how the bot remembers it asked. NULL for
+  everyone almost always. A column and not a Map because the bot restarts on
+  every deploy. It is checked *before* the AI call and cleared *first*, so a
+  throw cannot trap someone in a question they cannot escape.
+- **`LEDGER_STARTERS` in `core.js` is first-run only** — two ready-made ledgers
+  so somebody who typed "hii" starts with a tap rather than composing an emoji.
+  A ledger made from a starter is indistinguishable from one named by hand.
+- **`MAX_LEDGERS` is 20, in JS not SQL.** A per-user row limit needs a trigger;
+  one `if` says the same and can explain itself in the user's language.
+- **Isolation is by `workspace_id`, not `user_id`** — the same person owns them
+  all, so `user_id` alone would show the groceries inside the shop's `/summary`.
+  Every transaction read filters on both. The one deliberate exception is
+  `getMonthlySummaryAll()`, which is *meant* to cross ledgers; its join to
+  `workspaces` is what keeps it inside the user.
+- **The workspace is stamped on the message at arrival and read back off the
+  locked row at confirmation**, never from the user's current setting.
+  Otherwise switching between typing and tapping Confirm would misfile the row.
+- `transactions.workspace_id` is deliberately nullable for rows predating
+  `ebcb1a0` — see `migrations/002_workspaces.sql`.
+
+## The menu
+
+`/menu`, `/start` and `/help` are all `sendWelcomeHelp()`. Four buttons:
+this month here, this month everywhere, switch ledger, new ledger — plus the
+language row. The active ledger's name is inside the *button label*, so it can
+be tapped without reading the message. `menu:` is routed in `callbacks.js`
+above the `Number(messageId)` parse and whitelisted against `MENU_SCREENS`,
+exactly like `ws:` / `lang:` / `onb:`.
 
 ## Languages
 
 English, Hindi and Gujarati. `src/i18n/` holds one catalog per language
-(`en.js` is the reference, ~127 keys) plus `index.js` with `LANGUAGES`, `t()`,
+(`en.js` is the reference, ~145 keys) plus `index.js` with `LANGUAGES`, `t()`,
 `translator()`, `isLanguage()`, `enumLabel()`, `formatDate()` and
 `formatMonth()`. No i18n dependency.
 
@@ -202,13 +242,56 @@ could not read it:
 - **The khata block is one arrow line** (`રાજનું બાકી: ₹5,000 → ₹7,000`)
   rather than the old `Currently owes:` / `After this entry:` pair.
 
-### `/help` is `/start`
+### `/help` is `/start` is `/menu`
 
-`/help` used to be a second near-copy of `sendWelcomeHelp` that showed the
-shop commands to household users and patched it with a footnote. It now calls
-`sendWelcomeHelp(chatId, user, workspace)`, which branches on ledger type — so
-a household user is never shown `/udhaar`. Slash command NAMES stay ASCII
-(Telegram requires it); only the description beside each one is translated.
+All three call `sendWelcomeHelp(chatId, user, workspace)` — see **The menu**
+above. It used to branch on ledger type so a household was never shown
+`/udhaar`; there is nothing left to branch on, because every ledger does
+everything. Slash command NAMES stay ASCII (Telegram requires it); only the
+description beside each one is translated.
+
+## The money model
+
+**The AI answers the DIRECTION, not a type name.** A fixed `transaction_type`
+enum only works if the code knows what each member *means* — that `credit_sale`
+is goods-out-no-cash, that `repayment` is cash-but-not-revenue. That knowledge
+was a lookup table spread across `summary.service.js`, `customers.js`,
+`khata.js` and `cards.js`, and a lookup table is the opposite of a ledger the
+user invented and named themselves.
+
+Two fields, both `NOT NULL` with a `CHECK`, both `z.enum` in the schema:
+
+```
+cash   — "in" | "out" | "none"          did rupees actually move?
+udhaar — "they_owe_more" | "they_owe_less"
+       | "i_owe_more" | "i_owe_less" | "none"
+```
+
+- **They are independent, and that is the point.** A credit sale moves debt and
+  no cash; a repayment moves both; a gift moves cash and no debt. A single flat
+  enum had to invent a name for every combination, which is why it kept growing
+  — and it still could not record `i_owe_more`, money the *user* borrowed.
+- **`transaction_type` survives as a free-text LABEL**, written by the AI in the
+  user's language. Nothing branches on it. `enumLabel()` falls back to the raw
+  value, so "ઉધાર" renders as itself and pre-006 rows carrying `expense` still
+  render through the `type.*` catalog — which is why those keys stay.
+- **`amount` is validated positive.** The direction is carried by the two
+  fields, never by a minus sign: an expense sent as `-500` would *subtract* from
+  the outgoings it belongs in, and nothing would look broken.
+- **`transactions.owed_delta` is a GENERATED column** — the four-way udhaar →
+  plus-or-minus rule, derived by Postgres on write. Every khata query is
+  `SUM(owed_delta)`. It replaced five hand-written copies of that `CASE`.
+  `owedDelta()` in `transaction.schema.js` is its JS twin, used for one thing:
+  previewing `₹5,000 → ₹5,500` on a card whose row does not exist yet. Keep the
+  two in step; `tests/workspace.integration.js` asserts they agree.
+- **The khata is signed and user-wide.** Positive = they owe you, negative = you
+  owe them. Not scoped by ledger, deliberately: Raj owes *you*, not your Kirana
+  book, and someone you both lend to and borrow from is one number rather than
+  two half-truths.
+- **The confirmation card prints the direction in words, and that is a guard.**
+  Handing the model the arithmetic means a wrong `cash: "in"` on a light bill is
+  *valid input*. Zod and the `CHECK` can only refuse a value outside the enum;
+  that row is what lets the person who was there refuse a wrong one.
 
 ## Onboarding
 
@@ -253,13 +336,13 @@ zero.
   everything takes about ten seconds, trying nothing takes one tap. It appears
   only *after* a confirmed transaction, because `/summary` and `/monthly` have
   no empty state and would otherwise open on a wall of ₹0.
-- **`FEATURES_BY_WORKSPACE` in `src/schemas/transaction.schema.js` is the one
-  place that declares what each ledger can DO**, as `TYPES_BY_WORKSPACE` beside
-  it declares what each can RECORD. The tour builds its buttons from
-  `featuresForWorkspace()`, so a household is never offered a khata. It is
-  `?? []` fail-closed, and it is pure — which is the only way to test any of
-  this, since importing `bot.js` starts the bot polling.
-- **`TOUR` in `bot.js` holds each feature's label and handler in one entry**,
+- **The tour offers every feature to every ledger.** There used to be a
+  `FEATURES_BY_WORKSPACE` table so a household was never shown a khata; it is
+  gone with `TYPES_BY_WORKSPACE`, because a household borrows from an uncle as
+  readily as a shop lends to a regular, and a ledger named "Bike" is neither.
+  The buttons are built from `TOUR`'s own keys, so a feature cannot exist in
+  one place and not the other.
+- **`TOUR` in `telegram/onboarding.js` holds each feature's label and handler in one entry**,
   rather than a label map beside an action map that could drift and caption a
   button "undefined". `ONBOARDING_STEPS` is derived from its keys: a step
   missing from that whitelist does not reach "Unknown action", it falls
@@ -304,4 +387,4 @@ kpda dhova no sabu lavya"*. Both prompts ask for a **JSON list always**, and
   paths, deliberately, so the common one could not regress.
 - **Everything reads `transaction_data` as a list** via `[x].flat()`, so
   messages stored before this feature are still confirmable.
-- Transaction types: a shop uses `sale | purchase | expense | payment_received | payment_sent | credit_sale | repayment | other`; a household uses `expense | income | other`. `expense` is the only one both share.
+- See **The money model** above: there are no transaction types, only `cash` and `udhaar`.

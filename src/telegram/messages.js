@@ -4,6 +4,7 @@
 // call below it, not the database.
 
 import { processMessage } from "../services/transaction.service.js";
+import { setPendingAction } from "../database/users.js";
 import {
   createMessage,
   updateMessageStatus,
@@ -23,6 +24,7 @@ import {
 } from "./core.js";
 import { askToConfirm } from "./cards.js";
 import { answerBalanceQuery, answerHistoryQuery } from "./khata.js";
+import { createLedgerFromText } from "./onboarding.js";
 
 
 // Why nothing in a message could be recorded, and what to say about it.
@@ -32,8 +34,6 @@ import { answerBalanceQuery, answerHistoryQuery } from "./khata.js";
 // where the fifth one gets missed. `?? "error.transaction"` is the fallback,
 // so an unmapped reason apologises rather than printing a key.
 const UNSUPPORTED_KEY = {
-  CUSTOMER_QUERY_OUTSIDE_SHOP: "error.customerQueryAtHome",
-  TYPE_NOT_IN_WORKSPACE: "error.typeNotInWorkspace",
   NO_AMOUNT: "error.noAmount",
   NOT_UNDERSTOOD: "error.transaction",
 };
@@ -150,6 +150,19 @@ bot.on("message", async (message) => {
 
     const tr = translator(user);
 
+    // The bot asked a question and this is the answer, not a transaction.
+    //
+    // Checked BEFORE the AI call, in the same place the setup gate sits, so
+    // naming a ledger costs nothing. Cleared FIRST, whatever happens next: if
+    // createLedgerFromText throws, the user's next message is an ordinary
+    // message rather than a second attempt at a question they cannot escape.
+    if (user.pending_action === "new_ledger") {
+      await setPendingAction(user.id, null);
+      await createLedgerFromText(message.chat.id, user, message.text);
+
+      return;
+    }
+
     if (isOnboarding(user)) {
       onboardingUser = user;
       onboardingWorkspace = workspace;
@@ -182,20 +195,20 @@ bot.on("message", async (message) => {
       "PROCESSING"
     );
 
-    // Ask Groq what this message means and validate the answer with Zod.
-    // The workspace type picks which rules the AI is given and which
-    // transaction types are allowed back; the language decides only which
-    // language the description comes back in.
+    // Ask the AI what this message means and validate the answer with Zod.
+    // The language decides which language it writes back in; the ledger's name
+    // rides along as context, so "petrol" lands sensibly in a ledger called
+    // Bike. Neither is a rule the answer is checked against.
     const result = await processMessage(
       message.text,
       message.message_id,
-      workspace.type,
-      user.language
+      user.language,
+      workspace.name
     );
 
-    // The message made sense but does not belong in this ledger — a customer
-    // question asked at home, or a type this workspace cannot record. Say so
-    // plainly instead of failing with a generic apology.
+    // The message did not carry anything recordable — no amount, or nothing
+    // the AI could make sense of. Say so plainly instead of failing with a
+    // generic apology.
     if (result.intent === "unsupported") {
       // Mid-tutorial this is almost always a greeting, not a real attempt at
       // bookkeeping. Repeating the practice prompt keeps a brand new user on

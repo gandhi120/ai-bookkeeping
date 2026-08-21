@@ -4,8 +4,10 @@ import { pool } from "./pool.js";
 // Workspaces (which ledger the user is writing to)
 // --------------------------------------------------
 //
-// A workspace is a ledger owned by one user — their shop or their home.
-// It has no login and no members; the user just switches between their own.
+// A workspace is a ledger owned by one user, named by them — "Kirana Store",
+// "Bike", "Farm". It has no login and no members; the user just switches
+// between their own. Until migration 006 there were exactly two, a shop and a
+// home, and `type` was their identity; now the NAME is.
 // Every transaction read below is scoped by workspace_id, which is what keeps
 // the grocery bill out of the shop's /summary.
 
@@ -40,22 +42,33 @@ export async function getActiveWorkspace(userId) {
   return result.rows[0];
 }
 
-// Creates a workspace, or returns the existing one of that type.
+// Creates a ledger, or returns the user's existing one of that name.
 //
-// The upsert matters because "+ Add Household" is a Telegram button and
-// buttons get double-tapped. ON CONFLICT on the (user_id, type) unique index
-// means the second tap returns the same workspace instead of creating a
-// second home.
-export async function createWorkspace(userId, name, type) {
+// The upsert matters because "+ New ledger" is a Telegram button and buttons
+// get double-tapped. ON CONFLICT on the (user_id, lower(name)) unique index
+// means the second tap returns the same ledger instead of making a duplicate —
+// the same guarantee UNIQUE (user_id, type) used to give, moved onto the name.
+//
+// lower() because "Bike" and "bike" are the same ledger to whoever typed them.
+// Postgres accepts ON CONFLICT against an expression index as long as the
+// expression matches the index exactly — findOrCreateCustomer already does
+// this with the same shape.
+//
+// The emoji is updated on conflict but the name is not: re-sending
+// "🏍️ bike" when "Bike" exists should not silently re-case the ledger the
+// user is looking at in their switcher.
+export async function createWorkspace(userId, emoji, name) {
   const result = await pool.query(
     `
-    INSERT INTO workspaces (user_id, name, type)
+    INSERT INTO workspaces (user_id, emoji, name)
     VALUES ($1, $2, $3)
-    ON CONFLICT (user_id, type)
-    DO UPDATE SET updated_at = NOW()
+    ON CONFLICT (user_id, lower(name))
+    DO UPDATE SET
+      emoji = EXCLUDED.emoji,
+      updated_at = NOW()
     RETURNING *;
     `,
-    [userId, name, type]
+    [userId, emoji, name]
   );
 
   return result.rows[0];

@@ -88,29 +88,29 @@ async function resolveShopkeeper(from, chat) {
 }
 
 
-// The two ledgers a user can keep, and how they are shown.
+// Ready-made ledgers offered on the FIRST run only.
 //
-// `nameKey` is only the default name at creation — nothing looks a workspace
-// up by it, which is what makes translating it safe: the name is stored on
-// the row, so an existing ledger keeps whatever it was called and only new
-// ones are created in the user's language.
-const WORKSPACE_KINDS = {
-  shopkeeper: {
-    icon: "🏪",
-    nameKey: "workspace.nameShop",
-    labelKey: "ws.labelShop",
-  },
-  household: {
-    icon: "🏠",
-    nameKey: "workspace.nameHome",
-    labelKey: "ws.labelHome",
-  },
+// Not a type system — these fill in an emoji and a name so somebody who just
+// typed "hii" can start with one tap instead of being asked to compose an
+// emoji and a name before the bot has done anything for them. Once created,
+// one of these is indistinguishable from a ledger the user named themselves:
+// nothing looks a ledger up by which starter made it.
+//
+// `nameKey` is translated at creation and then stored on the row, so an
+// existing ledger keeps whatever it was called and only new ones follow the
+// user's current language.
+const LEDGER_STARTERS = {
+  shop: { emoji: "🏪", nameKey: "workspace.nameShop" },
+  home: { emoji: "🏠", nameKey: "workspace.nameHome" },
 };
 
 
-// "🏪 My Shop" — how a workspace is named everywhere in the UI.
+// "🏪 My Shop" — how a ledger is named everywhere in the UI.
+//
+// The emoji is a column now rather than a constant looked up by type, which
+// is the whole point: the user picked it.
 function workspaceLabel(workspace) {
-  return `${WORKSPACE_KINDS[workspace.type].icon} ${workspace.name}`;
+  return `${workspace.emoji ?? "📒"} ${workspace.name}`;
 }
 
 
@@ -189,8 +189,12 @@ async function askToChooseWorkspace(chatId, user) {
   await bot.sendMessage(chatId, tr("setup.welcome", { greeting }), {
     reply_markup: {
       inline_keyboard: [
-        [{ text: tr("setup.shopButton"), callback_data: "addws:shopkeeper" }],
-        [{ text: tr("setup.homeButton"), callback_data: "addws:household" }],
+        // Two ready-made ledgers and a way out of both. The starters exist so
+        // the first step is a tap; "make my own" is the same flow /menu uses
+        // later, so nothing here is a path that only new users ever walk.
+        [{ text: tr("setup.shopButton"), callback_data: "addws:shop" }],
+        [{ text: tr("setup.homeButton"), callback_data: "addws:home" }],
+        [{ text: tr("setup.ownButton"), callback_data: "addws:own" }],
       ],
     },
   });
@@ -208,17 +212,6 @@ function isOnboarding(user) {
 }
 
 
-// Which catalog key holds the practice example for each ledger type.
-// A purchase for the shop and a grocery expense for the home: both are the
-// most ordinary entry that ledger will ever see, so the example is one they
-// will actually repeat tomorrow — which is also why it is translated rather
-// than shown in English for a user to copy in a script they do not read.
-const PRACTICE_EXAMPLE_KEY = {
-  shopkeeper: "practice.exampleShop",
-  household: "practice.exampleHome",
-};
-
-
 // ONBOARDING STEP 3 — asks the user to type their first real transaction.
 //
 // Carries a skip button, because nobody should be held in a tutorial they did
@@ -230,7 +223,7 @@ async function sendPracticePrompt(chatId, user, workspace) {
 
   await bot.sendMessage(
     chatId,
-    tr("practice.prompt", { example: tr(PRACTICE_EXAMPLE_KEY[workspace.type]) }),
+    tr("practice.prompt", { example: tr("practice.example") }),
     {
       reply_markup: {
         inline_keyboard: [
@@ -282,21 +275,24 @@ function today() {
 
 // Money from a NAMED person, where the message never said what it was for.
 // "Received ₹5000 from Raj" might settle Raj's udhaar or might be ordinary
-// income. Only the shopkeeper knows, and guessing wrong silently changes
-// what a customer owes — so we ask instead of deciding.
+// income. Only the user knows, and guessing wrong silently changes what
+// somebody owes — so we ask instead of deciding.
 //
-// The AI only produces payment_received + a person for exactly this case:
-// anything that states it settles a debt comes back as `repayment`.
+// Expressed in the two axes: money came in, nobody's debt was said to change,
+// and a person was named. The prompt only produces that combination for
+// exactly this case — anything stating it settles a debt comes back with
+// udhaar already set, and money from nobody in particular has no person.
 function needsPaymentClarification(transaction) {
   return (
-    transaction.transaction_type === "payment_received" &&
+    transaction.cash === "in" &&
+    transaction.udhaar === "none" &&
     Boolean(transaction.person)
   );
 }
 
 export {
   resolveShopkeeper,
-  WORKSPACE_KINDS,
+  LEDGER_STARTERS,
   workspaceLabel,
   startSetup,
   askToChooseLanguage,

@@ -4,9 +4,9 @@
 // TOUR pairs each feature's label with the command that renders it, so a
 // button can never exist without a handler.
 
-import { featuresForWorkspace } from "../schemas/transaction.schema.js";
-import { setUserLanguage } from "../database/users.js";
+import { setUserLanguage, setPendingAction } from "../database/users.js";
 import {
+  getWorkspaces,
   getActiveWorkspace,
   createWorkspace,
   setActiveWorkspace,
@@ -16,7 +16,7 @@ import { isLanguage, translator } from "../i18n/index.js";
 import {
   bot,
   resolveShopkeeper,
-  WORKSPACE_KINDS,
+  LEDGER_STARTERS,
   workspaceLabel,
   askToChooseLanguage,
   askToChooseWorkspace,
@@ -86,8 +86,123 @@ async function handleLanguageAction(query, code) {
 // (`ws:<uuid>`) and creating one during onboarding (`addws:<type>`).
 //
 // Both payloads come from the user's Telegram client, so neither is trusted:
-// `addws` is looked up in WORKSPACE_KINDS, which is the whitelist, and
+// `addws` is looked up in LEDGER_STARTERS, which is the whitelist, and
 // setActiveWorkspace refuses a workspace that is not this user's.
+// How many ledgers one person may keep.
+//
+// Not a database constraint: a per-user row limit needs a trigger, and a
+// trigger is a thing that runs on every insert forever to guard a number
+// nobody reaches. One `if` says the same and can explain itself in the user's
+// language, which a constraint violation cannot.
+const MAX_LEDGERS = 20;
+
+// Longest ledger name. Past this the switcher buttons wrap and stop being
+// scannable, which is the whole job of the switcher.
+const MAX_LEDGER_NAME = 30;
+
+const DEFAULT_EMOJI = "📒";
+
+// Splits "🏍️ Bike" into an emoji and a name. A bare "Bike" gets 📒.
+//
+// Intl.Segmenter walks GRAPHEME clusters rather than code units, which is the
+// only reason this is four lines: 👨🏽‍🌾 is one character to the person who sent
+// it and five code points to JavaScript. A `/^\p{Extended_Pictographic}/u`
+// regex returns just 👨 and leaves 🏽‍🌾 glued to the front of the name.
+//
+// Stdlib — no emoji dependency, and no table of ranges to go stale when
+// Unicode adds more.
+const GRAPHEMES = new Intl.Segmenter();
+
+// Extended_Pictographic covers almost everything anyone would pick, but NOT
+// flags: 🇮🇳 is two Regional Indicator letters and neither is pictographic.
+// Segmenter already returns the pair as one grapheme; this is only about
+// recognising it as an emoji once it has.
+const EMOJI = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u;
+
+function parseLedger(text) {
+  const trimmed = (text ?? "").trim();
+  const [first] = GRAPHEMES.segment(trimmed);
+
+  const hasEmoji = Boolean(first) && EMOJI.test(first.segment);
+
+  return {
+    emoji: hasEmoji ? first.segment : DEFAULT_EMOJI,
+    name: (hasEmoji ? trimmed.slice(first.segment.length) : trimmed)
+      .trim()
+      .slice(0, MAX_LEDGER_NAME),
+  };
+}
+
+
+// Turns the message a user sent after tapping "New ledger" into a ledger.
+//
+// Every refusal names what to do next, because the user has already been told
+// the bot is waiting for something and a bare "no" leaves them stuck.
+async function createLedgerFromText(chatId, user, text) {
+  const tr = translator(user);
+
+  const { emoji, name } = parseLedger(text);
+
+  // An emoji on its own is not a name. Without this the upsert would create a
+  // ledger called "" that the switcher renders as a lone icon.
+  if (!name) {
+    await bot.sendMessage(chatId, tr("ledger.needName"));
+
+    return;
+  }
+
+  const existing = await getWorkspaces(user.id);
+
+  if (existing.length >= MAX_LEDGERS) {
+    await bot.sendMessage(chatId, tr("ledger.tooMany", { max: MAX_LEDGERS }));
+
+    return;
+  }
+
+  // The upsert returns the existing row for a name already in use, so this
+  // check is what turns a silent no-op into an explanation. Compared the same
+  // way the unique index compares.
+  const duplicate = existing.find(
+    (ledger) => ledger.name.toLowerCase() === name.toLowerCase()
+  );
+
+  if (duplicate) {
+    await bot.sendMessage(
+      chatId,
+      tr("ledger.duplicate", { ledger: workspaceLabel(duplicate) })
+    );
+
+    return;
+  }
+
+  const workspace = await createWorkspace(user.id, emoji, name);
+
+  await setActiveWorkspace(user.id, workspace.id);
+
+  await bot.sendMessage(
+    chatId,
+    tr("ledger.created", { workspace: workspaceLabel(workspace) })
+  );
+
+  // A first-time user has just answered the only question the bot cannot work
+  // without, so they are walked through recording something rather than left
+  // with a hint. Somebody adding their fourth ledger is not new.
+  if (isOnboarding(user)) {
+    await sendPracticePrompt(chatId, user, workspace);
+  }
+}
+
+
+// Asks for the emoji and name, and records that the next message is the answer.
+async function askForLedgerName(chatId, user) {
+  const tr = translator(user);
+
+  await setPendingAction(user.id, "new_ledger");
+
+  await bot.sendMessage(chatId, tr("ledger.prompt"));
+}
+
+
 async function handleWorkspaceAction(query, action, value) {
   const chatId = query.message.chat.id;
 
@@ -98,15 +213,29 @@ async function handleWorkspaceAction(query, action, value) {
   let workspace;
 
   if (action === "addws") {
-    const kind = WORKSPACE_KINDS[value];
+    // "Make my own" is not a starter — it asks a question instead of creating
+    // anything, so it returns here rather than falling through to the
+    // "now using" edit below.
+    if (value === "own") {
+      await bot.answerCallbackQuery(query.id);
+      await askForLedgerName(chatId, user);
 
-    if (!kind) {
+      return;
+    }
+
+    const starter = LEDGER_STARTERS[value];
+
+    if (!starter) {
       await bot.answerCallbackQuery(query.id, { text: tr("toast.unknownWorkspace") });
 
       return;
     }
 
-    workspace = await createWorkspace(user.id, tr(kind.nameKey), value);
+    workspace = await createWorkspace(
+      user.id,
+      starter.emoji,
+      tr(starter.nameKey)
+    );
     await setActiveWorkspace(user.id, workspace.id);
   } else {
     // A forged or stale uuid updates nothing and returns undefined.
@@ -150,9 +279,7 @@ async function handleWorkspaceAction(query, action, value) {
 
   await bot.sendMessage(
     chatId,
-    workspace.type === "household"
-      ? tr("ws.hintHome")
-      : tr("ws.hintShop")
+    tr("ws.hint")
   );
 }
 
@@ -172,8 +299,10 @@ async function handleWorkspaceAction(query, action, value) {
 // never have a button with no handler or a handler with no label — the second
 // would send Telegram a button captioned "undefined".
 //
-// WHICH of these a given user sees comes from featuresForWorkspace(), so a
-// household is never offered a khata.
+// Every ledger offers all four. There used to be a FEATURES_BY_WORKSPACE table
+// so a household was never shown a khata — but a household lends and borrows
+// too, and a ledger the user named "Bike" is neither kind. The udhaar book is
+// the user's, not one ledger's.
 //
 // `label` is a catalog key rather than the text itself, so the button and the
 // screen it opens can be translated independently — which matters right now,
@@ -195,8 +324,8 @@ const TOUR = {
 async function sendFeatureTour(chatId, user, workspace, introKey) {
   const tr = translator(user);
 
-  const featureRows = featuresForWorkspace(workspace.type).map((feature) => [
-    { text: tr(TOUR[feature].label), callback_data: `onb:${feature}` },
+  const featureRows = Object.entries(TOUR).map(([feature, { label }]) => [
+    { text: tr(label), callback_data: `onb:${feature}` },
   ]);
 
   await bot.sendMessage(chatId, tr(introKey), {
@@ -338,6 +467,11 @@ export {
   handleLanguageAction,
   handleWorkspaceAction,
   handleOnboardingAction,
+  createLedgerFromText,
+  askForLedgerName,
+  parseLedger,
+  MAX_LEDGERS,
+  MAX_LEDGER_NAME,
   ONBOARDING_STEPS,
   sendFeatureTour,
 };

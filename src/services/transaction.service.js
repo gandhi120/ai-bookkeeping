@@ -1,8 +1,5 @@
 import { askAI } from "../ai/groq.service.js";
-import {
-  MessageSchema,
-  isTypeAllowedInWorkspace,
-} from "../schemas/transaction.schema.js";
+import { MessageSchema } from "../schemas/transaction.schema.js";
 
 // Turns one raw Telegram message into a validated, structured result.
 //
@@ -11,9 +8,9 @@ import {
 // Confirm. Keeping the AI logic and the SQL in separate files means either
 // one can change without breaking the other.
 //
-// `workspaceType` tells the AI which ledger it is reading for, and decides
-// which transaction types are legal. It defaults to "shopkeeper" so an
-// un-updated caller behaves exactly as before workspaces existed.
+// `ledgerName` is the name the user gave the ledger this message arrived in.
+// It is passed to the AI as context and nothing else reads it — there are no
+// per-ledger rules any more, because the ledger is whatever the user called it.
 //
 // `language` is passed straight through to the AI, which uses it for one
 // thing only: the language "description" comes back in. Nothing here reads
@@ -36,12 +33,12 @@ export const MAX_ENTRIES = 10;
 export async function processMessage(
   messageText,
   telegramMessageId,
-  workspaceType = "shopkeeper",
-  language = "en"
+  language = "en",
+  ledgerName = null
 ) {
   // 1. Ask the AI to understand the shopkeeper's message. Groq answers
   //    normally; Gemini takes over automatically if Groq is unavailable.
-  const aiResponse = await askAI(messageText, workspaceType, language);
+  const aiResponse = await askAI(messageText, language, ledgerName);
 
   // 2. Convert the JSON text into JavaScript. If it is not JSON this throws,
   //    and the caller marks the message FAILED.
@@ -60,13 +57,9 @@ export async function processMessage(
   );
 
   if (query) {
-    // Only a shop has customers, so only a shop can be asked about a khata.
-    // The household prompt is told never to produce these, but the prompt is
-    // an instruction and this is the rule.
-    if (workspaceType !== "shopkeeper") {
-      return { intent: "unsupported", reason: "CUSTOMER_QUERY_OUTSIDE_SHOP" };
-    }
-
+    // Every ledger can be asked this now. A khata belongs to the USER, not to
+    // one ledger — Raj owes you, he does not owe your Kirana book — so there
+    // is no ledger a balance question is out of place in.
     const validated = MessageSchema.parse(query);
 
     return { intent: validated.intent, person: validated.person };
@@ -80,7 +73,7 @@ export async function processMessage(
   //    falls by itself, and what was dropped is reported back so the user is
   //    told rather than left to notice.
   const transactions = [];
-  const skipped = { noAmount: 0, wrongType: 0, invalid: 0, capped: 0 };
+  const skipped = { noAmount: 0, invalid: 0, capped: 0 };
 
   for (const entry of entries) {
     if (transactions.length >= MAX_ENTRIES) {
@@ -92,8 +85,8 @@ export async function processMessage(
     const result = MessageSchema.safeParse(entry);
 
     if (!result.success) {
-      // The prompts say "never invent an amount, use null if missing" while
-      // the schema requires a number — so a missing amount is the single most
+      // The prompt says "never invent an amount, use null if missing" while
+      // the schema requires a positive number — so amount is the single most
       // common validation failure, and the only one worth naming to the user,
       // because "how many rupees?" is something they can answer.
       const aboutAmount = result.error.issues.some((issue) =>
@@ -102,15 +95,6 @@ export async function processMessage(
 
       if (aboutAmount) skipped.noAmount++;
       else skipped.invalid++;
-
-      continue;
-    }
-
-    // The workspace, not the AI, decides which types may be recorded. This is
-    // what stops a hallucinated credit_sale on a household grocery message
-    // from opening a khata.
-    if (!isTypeAllowedInWorkspace(workspaceType, result.data.transaction_type)) {
-      skipped.wrongType++;
 
       continue;
     }
@@ -131,10 +115,6 @@ export async function processMessage(
   //    the existing reasons, so the bot's replies for these cases are the ones
   //    it already had.
   if (transactions.length === 0) {
-    if (skipped.wrongType > 0) {
-      return { intent: "unsupported", reason: "TYPE_NOT_IN_WORKSPACE" };
-    }
-
     if (skipped.noAmount > 0) {
       return { intent: "unsupported", reason: "NO_AMOUNT" };
     }

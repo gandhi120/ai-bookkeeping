@@ -51,27 +51,30 @@ export async function getCustomerByName(userId, name) {
   return result.rows[0];
 }
 
-// Calculates how much a customer currently owes.
+// Calculates what stands between the user and this person.
 //
 // The balance is DERIVED by summing the ledger, never stored in a column.
 // A stored number would drift out of sync the moment any insert failed;
 // a sum recalculated from the rows themselves cannot lie.
 //
-//   credit_sale -> customer took goods, owes MORE  (+)
-//   repayment   -> customer paid back,   owes LESS (-)
+// SIGNED, and the sign is the whole answer:
+//   POSITIVE -> they owe the user
+//   NEGATIVE -> the user owes them
+//
+// `owed_delta` is a GENERATED column (migration 006). The four-way udhaar ->
+// plus-or-minus rule lives in the schema and nowhere else — it used to be
+// written out three times in this file alone, plus once in khata.js and once
+// in cards.js, and every copy had to be updated together.
+//
+// It is also what makes one khata cover both directions. A person you lend to
+// and borrow from is one row and one number, not two half-truths.
 //
 // Returns a Number. Postgres returns numeric as a string in node-postgres
 // (to avoid float precision loss), so it is converted explicitly.
 export async function getCustomerBalance(userId, customerId) {
   const result = await pool.query(
     `
-    SELECT COALESCE(SUM(
-      CASE
-        WHEN transaction_type = 'credit_sale' THEN amount
-        WHEN transaction_type = 'repayment'   THEN -amount
-        ELSE 0
-      END
-    ), 0) AS outstanding
+    SELECT COALESCE(SUM(owed_delta), 0) AS outstanding
     FROM transactions
     WHERE user_id = $1
       AND customer_id = $2;
@@ -101,35 +104,33 @@ export async function getCustomerTransactions(userId, customerId, limit = 20) {
   return result.rows;
 }
 
-// Lists every customer of this shopkeeper who still owes money,
-// largest debt first. Powers the /udhaar overview command.
+// Lists everyone with an open khata, in either direction. Powers /udhaar.
+//
+// Ordered DESC so the biggest debts owed TO the user come first and the people
+// the user owes sit at the bottom — /udhaar renders that as two blocks. abs()
+// would interleave them, which is exactly the wrong reading.
+//
 // HAVING filters on the summed total, because WHERE cannot see aggregates.
+// Note it can reference SUM(owed_delta) directly: Postgres will not accept an
+// output alias in HAVING, so before the generated column existed this query
+// had to spell the whole CASE out a second time.
+//
+// Settled khatas drop out. Someone who paid up in March should not sit in the
+// list at zero forever.
 export async function getAllOutstanding(userId) {
   const result = await pool.query(
     `
     SELECT
       c.id,
       c.name,
-      SUM(
-        CASE
-          WHEN t.transaction_type = 'credit_sale' THEN t.amount
-          WHEN t.transaction_type = 'repayment'   THEN -t.amount
-          ELSE 0
-        END
-      ) AS outstanding
+      SUM(t.owed_delta) AS outstanding
     FROM customers c
     JOIN transactions t
       ON t.customer_id = c.id
      AND t.user_id = c.user_id
     WHERE c.user_id = $1
     GROUP BY c.id, c.name
-    HAVING SUM(
-      CASE
-        WHEN t.transaction_type = 'credit_sale' THEN t.amount
-        WHEN t.transaction_type = 'repayment'   THEN -t.amount
-        ELSE 0
-      END
-    ) <> 0
+    HAVING SUM(t.owed_delta) <> 0
     ORDER BY outstanding DESC;
     `,
     [userId]

@@ -105,9 +105,11 @@ async function submitAndConfirm(user, workspace, msgId, transaction, isOnboardin
   return saved;
 }
 
-function txn(type, person, amount, description) {
+function txn(cash, udhaar, person, amount, description) {
   return {
-    transaction_type: type,
+    transaction_type: description,
+    cash,
+    udhaar,
     description,
     category: "test",
     quantity: 1,
@@ -136,7 +138,7 @@ const SHOP = {};
 
 try {
   for (const u of [userA, userB]) {
-    SHOP[u.id] = await createWorkspace(u.id, "My Shop", "shopkeeper");
+    SHOP[u.id] = await createWorkspace(u.id, "🏪", "My Shop");
     await setActiveWorkspace(u.id, SHOP[u.id].id);
   }
 
@@ -155,7 +157,7 @@ try {
     userA,
     SHOP[userA.id],
     910001,
-    txn("purchase", null, 600, "Bought 10 kg rice"),
+    txn("out", "none", null, 600, "Bought 10 kg rice"),
     true
   );
 
@@ -165,7 +167,7 @@ try {
     userA,
     SHOP[userA.id],
     910002,
-    txn("credit_sale", "PracticeRaj", 2000, "Raj took goods on udhaar"),
+    txn("none", "they_owe_more", "PracticeRaj", 2000, "Raj took goods on udhaar"),
     true
   );
 
@@ -188,7 +190,7 @@ try {
     userB,
     SHOP[userB.id],
     920001,
-    txn("sale", null, 999, "B's own entry"),
+    txn("in", "none", null, 999, "B's own entry"),
     true
   );
 
@@ -222,7 +224,7 @@ try {
     userA,
     SHOP[userA.id],
     910003,
-    txn("sale", null, 1500, "A real sale"),
+    txn("in", "none", null, 1500, "A real sale"),
     false
   );
 

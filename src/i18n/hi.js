@@ -39,9 +39,6 @@ export default {
 
 {example}`,
 
-  "practice.exampleShop": "600 का 10 किलो चावल लिया",
-  "practice.exampleHome": "500 का सामान लिया",
-
   "practice.skip": "⏭ अभी नहीं",
 
   // Deliberately does not name the Confirm button: it is called "सही है"
@@ -101,7 +98,6 @@ export default {
 
   "skipped.noAmount":
     "⚠️ {count} छोड़ दीं — कितने रुपये थे दिखा नहीं। वो दोबारा रकम के साथ लिखिए।",
-  "skipped.wrongType": "⚠️ {count} छोड़ दीं, वो इस बही की नहीं हैं।",
   "skipped.invalid": "⚠️ {count} छोड़ दीं, वो समझ नहीं आईं।",
   "skipped.capped":
     "⚠️ एक बार में {max} तक ही लिख सकता हूँ — बाकी {count} अलग से लिखिए।",
@@ -148,20 +144,13 @@ export default {
   "cat.entertainment": "मनोरंजन",
   "cat.subscriptions": "हर महीने का",
   "cat.salary": "तनख्वाह",
+  "cat.stock": "माल",
   "cat.other": "दूसरा",
 
   "summary.dailyTitle": "📊 {workspace} — आज",
   "summary.monthlyTitle": "📊 {workspace} — इस महीने",
   "summary.date": "तारीख:",
   "summary.count": "एंट्री:",
-
-  "summary.income": "आमदनी:",
-  "summary.expenses": "खर्च:",
-  "summary.balance": "बचत:",
-
-  "summary.sales": "बिक्री:",
-  "summary.purchases": "खरीद:",
-  "summary.netBalance": "कुल:",
 
   "summary.whereItWent": "कहाँ खर्च हुआ:",
 
@@ -171,8 +160,6 @@ export default {
 
   "udhaar.title": "📒 उधार बही",
   "udhaar.total": "कुल बाकी:",
-  "udhaar.wrongLedger":
-    "📒 उधार दुकान के लिए है। किसका उधार बाकी है देखने के लिए /workspace से दुकान पर आइए।",
   "udhaar.empty": `📒 अभी किसी का कुछ बाकी नहीं है।
 
 जब आप लिखेंगे "राज ने 2000 का माल उधार लिया", तब से राज यहाँ दिखेगा, जब तक वो चुका न दे।`,
@@ -185,62 +172,7 @@ export default {
   "khata.noEntries": "📋 {person} की अभी कोई एंट्री नहीं है।",
   "khata.outstanding": "बाकी:",
 
-  "ws.labelShop": "दुकान",
-  "ws.labelHome": "घर",
-
   "ws.current": "कौन सी बही?",
-  "ws.add": "+ {label} जोड़ें",
-
-  "ws.hintShop": `दुकान की बातें लिखिए, जैसे "5 शर्ट 2500 में बेचीं" या "राज ने 2000 का माल उधार लिया"।`,
-  "ws.hintHome": `घर का खर्च लिखिए, जैसे "500 का सामान लिया" या "65000 तनख्वाह आई"।`,
-
-  "help.home": `👋 आप {workspace} में हैं।
-
-बस लिखिए क्या खर्च हुआ, आम भाषा में।
-
-"500 का सामान लिया"
-"बिजली का बिल 2400 भरा"
-"65000 तनख्वाह आई"
-
-कमांड:
-
-/summary - आज का हिसाब
-/transactions - आज की एंट्री
-/monthly - इस महीने का
-/workspace - दुकान या घर बदलें
-/language - भाषा बदलें / भाषा / ભાષા
-/help - यही दिखाएँ`,
-
-  "help.shop": `👋 आप {workspace} में हैं।
-
-बस लिखिए क्या हुआ, आम भाषा में।
-
-खरीद-बिक्री:
-
-"600 का 10 किलो चावल लिया"
-"5 शर्ट 2500 में बेचीं"
-"बिजली का बिल 1800 भरा"
-
-उधार:
-
-"राज ने 2000 का माल उधार लिया"
-"राज ने 1000 दिए"
-
-कुछ भी पूछिए:
-
-"राज का कितना बाकी है?"
-"राज की एंट्री दिखाओ"
-
-कमांड:
-
-/summary - आज का हिसाब
-/transactions - आज की एंट्री
-/monthly - इस महीने का
-/udhaar - किसका उधार बाकी है
-/workspace - दुकान या घर बदलें
-/language - भाषा बदलें / भाषा / ભાષા
-/help - यही दिखाएँ`,
-
   "toast.notFound": "वो एंट्री नहीं मिली।",
   "toast.alreadyDone": "ये पहले ही हो चुका है।",
   "toast.dataMissing": "उस एंट्री की जानकारी नहीं मिली।",
@@ -262,8 +194,53 @@ export default {
   "error.rateLimit":
     "एक साथ बहुत हो गया — एक मिनट रुकिए, फिर लिखते रहिए।",
 
-  "error.customerQueryAtHome":
-    "ये ग्राहक की बात है, और {workspace} में कोई ग्राहक नहीं होता। /workspace से दुकान पर आइए।",
-  "error.typeNotInWorkspace":
-    "ये {workspace} में नहीं लिख सका। थोड़ा अलग तरीके से लिखिए, या /workspace से बही बदलिए।",
+  // --------------------------------------------------
+  // मेन्यू
+  // --------------------------------------------------
+
+  "help.menu":
+    "📒 आप {workspace} में हैं\n\nजो हुआ वो बता दीजिए, मैं लिख लूँगा।\n\"1200 की 3 शर्ट बेचीं\"\n\"राजू ने 500 का सामान उधार लिया\"\n\nकमांड: /menu /summary /monthly /transactions /udhaar /workspace /language",
+
+  "menu.thisLedger": "📊 इस महीने — {workspace}",
+  "menu.allLedgers": "🌍 इस महीने — सभी बहीखाते",
+  "menu.switch": "🔀 बहीखाता बदलें",
+  "menu.newLedger": "➕ नया बहीखाता",
+  "menu.allTitle": "🌍 सभी बहीखाते",
+  "menu.everything": "कुल:",
+  "menu.allEmpty": "इस महीने अभी किसी भी बहीखाते में कुछ नहीं लिखा गया।",
+
+  // --------------------------------------------------
+  // नया बहीखाता
+  // --------------------------------------------------
+
+  "ledger.prompt":
+    "➕ नया बहीखाता\n\nएक इमोजी और नाम साथ में भेजिए:\n\n🏍️ बाइक\n🌾 खेत\n🏪 दूसरी दुकान\n\nसिर्फ नाम भी चलेगा — तब मैं 📒 लगा दूँगा।",
+  "ledger.created": "✅ {workspace} तैयार है, और अब आप उसी में हैं।",
+  "ledger.needName": "ये सिर्फ इमोजी है — साथ में नाम भी भेजिए, जैसे 🏍️ बाइक।",
+  "ledger.duplicate":
+    "{ledger} पहले से है। दूसरा नाम रखिए, या /menu से उसी में चले जाइए।",
+  "ledger.tooMany":
+    "आपके पास {max} बहीखाते हैं, इससे ज़्यादा मैं सँभाल नहीं पाऊँगा। किसी पुराने का ही इस्तेमाल कीजिए।",
+
+  // --------------------------------------------------
+  // पैसा किधर गया
+  // --------------------------------------------------
+
+  "card.moneyIn": "पैसे आए",
+  "card.moneyOut": "पैसे गए",
+
+  "summary.moneyIn": "आए:",
+  "summary.moneyOut": "गए:",
+  "summary.net": "बचे:",
+  "summary.onUdhaar": "उधार पर:",
+
+  "khata.youOwe": "📒 आपको {person} को {amount} देने हैं।",
+
+  // --------------------------------------------------
+  // शुरुआत
+  // --------------------------------------------------
+
+  "setup.ownButton": "✏️ अपना बनाऊँ",
+  "ws.hint": "अब आप जो भी लिखेंगे वो इसी बहीखाते में जाएगा।",
+  "practice.example": "600 के 10 किलो चावल खरीदे",
 };

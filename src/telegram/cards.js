@@ -6,7 +6,10 @@
 // payment meant, and the ordinary confirm card otherwise.
 
 import { MAX_ENTRIES } from "../services/transaction.service.js";
-import { isCustomerTransaction } from "../schemas/transaction.schema.js";
+import {
+  isCustomerTransaction,
+  owedDelta,
+} from "../schemas/transaction.schema.js";
 import { getCustomerByName, getCustomerBalance } from "../database/customers.js";
 import {
   DEFAULT_LANGUAGE,
@@ -28,12 +31,21 @@ import {
 //
 //     ખરીદી: 10 કિલો ચોખા
 //     રકમ: ₹600
+//     બહાર ગયા
 //     તારીખ: 16 ઑગસ્ટ 2026
 //
 // The transaction TYPE is the first row's LABEL rather than a value. That is
 // what collapsed the old six rows into three: "Type: expense" and
 // "Description: groceries" were saying the same thing twice, once as a raw
-// database identifier and once in the user's language.
+// database identifier and once in the user's language. It is now written by
+// the AI in the user's language; enumLabel falls back to the raw value, so
+// pre-006 rows still render through the type.* catalog.
+//
+// THE DIRECTION ROW IS NOT DECORATION. The AI decides which way the money
+// went, and a wrong "in" on an electricity bill is valid input that silently
+// books ₹2,400 on the wrong side of the month. Zod and the CHECK constraint
+// can only refuse a value outside the enum; this row is what lets the person
+// who was actually there refuse a wrong one, before they tap.
 //
 // Category is deliberately absent. It cannot be corrected from this card, it
 // only feeds the /monthly breakdown, and it was the row duplicating the
@@ -44,7 +56,7 @@ function transactionCard(user, transaction) {
 
   // For a khata entry the customer IS what the shopkeeper is confirming;
   // for everything else it is the thing bought or sold.
-  const what = isCustomerTransaction(transaction.transaction_type)
+  const what = isCustomerTransaction(transaction)
     ? transaction.person
     : transaction.description;
 
@@ -59,6 +71,11 @@ function transactionCard(user, transaction) {
   }
 
   rows.push(`${tr("confirm.amount")} ${money(transaction.amount)}`);
+
+  // Nothing is said when cash is "none": that is a pure udhaar entry, and the
+  // khata line under the card already says what moved.
+  if (transaction.cash === "in") rows.push(tr("card.moneyIn"));
+  if (transaction.cash === "out") rows.push(tr("card.moneyOut"));
 
   if (transaction.transaction_date) {
     rows.push(
@@ -88,7 +105,7 @@ function transactionListCard(user, transactions) {
   const sameDay = dates.size === 1;
 
   const lines = transactions.map((transaction) => {
-    const what = isCustomerTransaction(transaction.transaction_type)
+    const what = isCustomerTransaction(transaction)
       ? transaction.person
       : transaction.description;
 
@@ -96,13 +113,28 @@ function transactionListCard(user, transactions) {
       ? ""
       : `  ${formatDate(language, transaction.transaction_date, { year: false })}`;
 
-    return `${enumLabel(language, "type", transaction.transaction_type)}: ${what} — ${money(
+    // The direction, one character. The full words are what the single-entry
+    // card uses; on a list of five they would be the longest thing on every
+    // line. "+" and "−" against a rupee amount need no translation.
+    const sign =
+      transaction.cash === "in" ? "+" : transaction.cash === "out" ? "−" : "";
+
+    return `${enumLabel(language, "type", transaction.transaction_type)}: ${what} — ${sign}${money(
       transaction.amount
     )}${when}`;
   });
 
+  // The NET, not a blind sum. Entries typed in one breath are often mixed
+  // ("sold 2000, paid the supplier 800"), and adding those together produces a
+  // number that is not any real quantity — which is the one number a
+  // single-tap Confirm asks the user to check.
   const total = transactions.reduce(
-    (sum, transaction) => sum + Number(transaction.amount),
+    (sum, transaction) =>
+      transaction.cash === "in"
+        ? sum + Number(transaction.amount)
+        : transaction.cash === "out"
+        ? sum - Number(transaction.amount)
+        : sum,
     0
   );
 
@@ -134,27 +166,33 @@ function skippedNotes(user, skipped) {
 }
 
 
-// The money rows shared by /summary and /monthly.
+// The money rows shared by /summary, /monthly and the all-ledgers view.
 //
-// A household reports income against expenses and where the money went; a
-// shop reports sales against purchases. Different questions, so this is two
-// layouts rather than one with some rows blanked out.
+// ONE layout now. There used to be two — sales-against-purchases for a shop,
+// income-against-expenses for a home — picked by workspace.type. A ledger the
+// user named "Bike" is neither, and both layouts were answering the same
+// question in different words: what came in, what went out, what is left.
+//
+// `onUdhaar` gets its own line rather than joining either total: the goods
+// left but the cash has not arrived, so counting it as money in would overstate
+// the month and leaving it out entirely would hide it.
 //
 // `categories` is off for the daily view: a single day's spending broken down
 // by category is usually one line repeating what is already on screen.
-function summaryBody(user, workspace, summary, { categories = false } = {}) {
+function summaryBody(user, summary, { categories = false } = {}) {
   const tr = translator(user);
 
-  if (workspace.type !== "household") {
-    return `${tr("summary.sales")} ${money(summary.totalSales)}
-${tr("summary.purchases")} ${money(summary.totalPurchases)}
-${tr("summary.expenses")} ${money(summary.totalExpenses)}
-${tr("summary.netBalance")} ${money(summary.netBalance)}`;
+  const lines = [
+    `${tr("summary.moneyIn")} ${money(summary.moneyIn)}`,
+    `${tr("summary.moneyOut")} ${money(summary.moneyOut)}`,
+    `${tr("summary.net")} ${money(summary.net)}`,
+  ];
+
+  if (summary.onUdhaar > 0) {
+    lines.push(`${tr("summary.onUdhaar")} ${money(summary.onUdhaar)}`);
   }
 
-  const rows = `${tr("summary.income")} ${money(summary.totalIncome)}
-${tr("summary.expenses")} ${money(summary.totalExpenses)}
-${tr("summary.balance")} ${money(summary.balance)}`;
+  const rows = lines.join("\n");
 
   if (!categories || summary.byCategory.length === 0) return rows;
 
@@ -288,20 +326,16 @@ async function askToConfirm(
   const khataLines = [];
 
   for (const transaction of transactions) {
-    if (
-      !isCustomerTransaction(transaction.transaction_type) ||
-      !transaction.person
-    ) {
+    if (!isCustomerTransaction(transaction) || !transaction.person) {
       continue;
     }
 
     const customer = await getCustomerByName(user.id, transaction.person);
     const current = customer ? await getCustomerBalance(user.id, customer.id) : 0;
 
-    const after =
-      transaction.transaction_type === "credit_sale"
-        ? current + Number(transaction.amount)
-        : current - Number(transaction.amount);
+    // owedDelta() mirrors the owed_delta generated column, and is used here
+    // because this row does not exist yet — there is nothing to read it off.
+    const after = current + owedDelta(transaction);
 
     khataLines.push(
       tr("confirm.khataChange", {

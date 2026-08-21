@@ -69,9 +69,6 @@ Type this, or your own version:
 
   // The most ordinary entry each ledger will ever see, so the example is one
   // the user will actually repeat tomorrow.
-  "practice.exampleShop": "Bought 10 kg rice for ₹600",
-  "practice.exampleHome": "Bought groceries for ₹500",
-
   "practice.skip": "⏭ Skip setup",
 
   // --------------------------------------------------
@@ -160,7 +157,6 @@ Clear them so your real accounts start from zero?`,
   // the end of the month.
   "skipped.noAmount":
     "⚠️ Left out {count} — I couldn't see the amount. Send those again with the rupees.",
-  "skipped.wrongType": "⚠️ Left out {count} that don't belong in this book.",
   "skipped.invalid": "⚠️ Left out {count} I couldn't follow.",
   "skipped.capped":
     "⚠️ {max} at a time is my limit — send the remaining {count} separately.",
@@ -227,6 +223,7 @@ Clear them so your real accounts start from zero?`,
   "cat.entertainment": "Entertainment",
   "cat.subscriptions": "Subscriptions",
   "cat.salary": "Salary",
+  "cat.stock": "Stock",
   "cat.other": "Other",
 
   // --------------------------------------------------
@@ -237,14 +234,6 @@ Clear them so your real accounts start from zero?`,
   "summary.monthlyTitle": "📊 {workspace} — This Month",
   "summary.date": "Date:",
   "summary.count": "Entries:",
-
-  "summary.income": "Income:",
-  "summary.expenses": "Spent:",
-  "summary.balance": "Left:",
-
-  "summary.sales": "Sales:",
-  "summary.purchases": "Purchases:",
-  "summary.netBalance": "Net:",
 
   "summary.whereItWent": "Where it went:",
 
@@ -262,8 +251,6 @@ Clear them so your real accounts start from zero?`,
 
   "udhaar.title": "📒 Udhaar Book",
   "udhaar.total": "Total pending:",
-  "udhaar.wrongLedger":
-    "📒 Udhaar is a shop thing. Switch to your shop with /workspace to see who owes you.",
   "udhaar.empty": `📒 Nobody owes you anything right now.
 
 When you write something like "Raj took goods for ₹2,000 on udhaar", Raj shows up here until he pays it back.`,
@@ -280,15 +267,7 @@ When you write something like "Raj took goods for ₹2,000 on udhaar", Raj shows
   // Workspaces
   // --------------------------------------------------
 
-  "ws.labelShop": "Shop",
-  "ws.labelHome": "Home",
-
   "ws.current": "Which books?",
-  "ws.add": "+ Add {label}",
-
-  "ws.hintShop": `Send me your shop entries, like "Sold 5 shirts for ₹2,500" or "Raj took goods for ₹2,000 on udhaar".`,
-  "ws.hintHome": `Send me your household spending, like "Bought groceries for ₹500" or "Salary received ₹65,000".`,
-
   // --------------------------------------------------
   // Help — one screen, branched by ledger
   // --------------------------------------------------
@@ -299,53 +278,6 @@ When you write something like "Raj took goods for ₹2,000 on udhaar", Raj shows
   //
   // Slash command NAMES stay ASCII — Telegram requires it — so only the
   // description beside each one is translated.
-
-  "help.home": `👋 You're in {workspace}.
-
-Just tell me what you spent, in normal words.
-
-"Bought groceries for ₹500"
-"Paid electricity bill ₹2,400"
-"Salary received ₹65,000"
-
-Commands:
-
-/summary - Today's money
-/transactions - Today's entries
-/monthly - This month
-/workspace - Switch shop or home
-/language - Change language / भाषा / ભાષા
-/help - Show this`,
-
-  "help.shop": `👋 You're in {workspace}.
-
-Just tell me what happened, in normal words.
-
-Buying and selling:
-
-"Bought 10 kg rice for ₹600"
-"Sold 5 shirts for ₹2,500"
-"Paid electricity bill ₹1,800"
-
-Udhaar:
-
-"Raj took goods for ₹2,000 on udhaar"
-"Raj paid ₹1,000"
-
-Ask me anything:
-
-"How much does Raj owe me?"
-"Show Raj's entries"
-
-Commands:
-
-/summary - Today's money
-/transactions - Today's entries
-/monthly - This month
-/udhaar - Who owes you
-/workspace - Switch shop or home
-/language - Change language / भाषा / ભાષા
-/help - Show this`,
 
   // --------------------------------------------------
   // Toasts and errors
@@ -375,8 +307,59 @@ Commands:
   "error.rateLimit":
     "That's a lot at once — give me a minute to catch up, then carry on.",
 
-  "error.customerQueryAtHome":
-    "That's a customer question, and {workspace} has no customers. Switch to your shop with /workspace.",
-  "error.typeNotInWorkspace":
-    "I couldn't record that in {workspace}. Try saying it differently, or switch with /workspace.",
+  // --------------------------------------------------
+  // The menu
+  // --------------------------------------------------
+
+  // The active ledger's name is in the BUTTON, not only in this text — the
+  // buttons are the interface for everyone who never learns a slash command.
+  "help.menu":
+    "📒 You're in {workspace}\n\nJust tell me what happened and I'll write it down.\n\"Sold 3 shirts for 1200\"\n\"Raju took 500 of goods on udhaar\"\n\nCommands: /menu /summary /monthly /transactions /udhaar /workspace /language",
+
+  "menu.thisLedger": "📊 This month — {workspace}",
+  "menu.allLedgers": "🌍 This month — all ledgers",
+  "menu.switch": "🔀 Switch ledger",
+  "menu.newLedger": "➕ New ledger",
+  "menu.allTitle": "🌍 All ledgers",
+  "menu.everything": "Everything:",
+  "menu.allEmpty": "Nothing recorded in any ledger this month yet.",
+
+  // --------------------------------------------------
+  // Making a ledger
+  // --------------------------------------------------
+
+  // Shows examples rather than describing the format: "send an emoji followed
+  // by a name" is a spec, and three lines someone can copy is an instruction.
+  "ledger.prompt":
+    "➕ New ledger\n\nSend an emoji and a name together:\n\n🏍️ Bike\n🌾 Farm\n🏪 Second Shop\n\nJust a name works too — I'll use 📒.",
+  "ledger.created": "✅ {workspace} is ready, and you're in it now.",
+  "ledger.needName": "That's just an emoji — send a name with it, like 🏍️ Bike.",
+  "ledger.duplicate":
+    "You already have {ledger}. Pick another name, or switch to it from /menu.",
+  "ledger.tooMany":
+    "You have {max} ledgers, which is as many as I can keep straight. Reuse one instead.",
+
+  // --------------------------------------------------
+  // Direction
+  // --------------------------------------------------
+
+  // Printed on every confirmation card. This is the row that lets the user
+  // catch the AI putting money on the wrong side before it reaches a total.
+  "card.moneyIn": "Money in",
+  "card.moneyOut": "Money out",
+
+  "summary.moneyIn": "In:",
+  "summary.moneyOut": "Out:",
+  "summary.net": "Net:",
+  "summary.onUdhaar": "On udhaar:",
+
+  "khata.youOwe": "📒 You owe {person} {amount}.",
+
+  // --------------------------------------------------
+  // Setup
+  // --------------------------------------------------
+
+  "setup.ownButton": "✏️ Make my own",
+  "ws.hint": "Everything you type now goes into this ledger.",
+  "practice.example": "Bought 10kg rice for 600",
 };

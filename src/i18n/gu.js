@@ -42,9 +42,6 @@ export default {
 
 {example}`,
 
-  "practice.exampleShop": "600 ના 10 કિલો ચોખા લીધા",
-  "practice.exampleHome": "500 નું કરિયાણું લીધું",
-
   "practice.skip": "⏭ અત્યારે નહીં",
 
   // Deliberately does not name the Confirm button: it is called "બરાબર છે"
@@ -106,7 +103,6 @@ export default {
 
   "skipped.noAmount":
     "⚠️ {count} છોડી દીધી — કેટલા રૂપિયા એ દેખાયું નહીં. એ ફરીથી રકમ સાથે લખો.",
-  "skipped.wrongType": "⚠️ {count} છોડી દીધી, એ આ ચોપડાની નથી.",
   "skipped.invalid": "⚠️ {count} છોડી દીધી, એ સમજાઈ નહીં.",
   "skipped.capped":
     "⚠️ એક વારમાં {max} સુધી જ લખી શકું — બાકીની {count} અલગથી લખો.",
@@ -153,20 +149,13 @@ export default {
   "cat.entertainment": "મોજશોખ",
   "cat.subscriptions": "દર મહિનાનું",
   "cat.salary": "પગાર",
+  "cat.stock": "માલ",
   "cat.other": "બીજું",
 
   "summary.dailyTitle": "📊 {workspace} — આજે",
   "summary.monthlyTitle": "📊 {workspace} — આ મહિને",
   "summary.date": "તારીખ:",
   "summary.count": "એન્ટ્રી:",
-
-  "summary.income": "આવક:",
-  "summary.expenses": "ખર્ચ:",
-  "summary.balance": "બચત:",
-
-  "summary.sales": "વેચાણ:",
-  "summary.purchases": "ખરીદી:",
-  "summary.netBalance": "કુલ:",
 
   "summary.whereItWent": "ક્યાં ખર્ચ થયું:",
 
@@ -176,8 +165,6 @@ export default {
 
   "udhaar.title": "📒 ઉધાર ચોપડો",
   "udhaar.total": "કુલ બાકી:",
-  "udhaar.wrongLedger":
-    "📒 ઉધાર દુકાન માટે છે. કોનું ઉધાર બાકી છે એ જોવા /workspace થી દુકાન પર આવો.",
   "udhaar.empty": `📒 અત્યારે કોઈનું કંઈ બાકી નથી.
 
 તમે લખશો "રાજે 2000 નો માલ ઉધાર લીધો", ત્યારથી રાજ અહીં દેખાશે, જ્યાં સુધી એ ચૂકવે નહીં.`,
@@ -190,62 +177,7 @@ export default {
   "khata.noEntries": "📋 {person}ની હજી કોઈ એન્ટ્રી નથી.",
   "khata.outstanding": "બાકી:",
 
-  "ws.labelShop": "દુકાન",
-  "ws.labelHome": "ઘર",
-
   "ws.current": "કયો ચોપડો?",
-  "ws.add": "+ {label} ઉમેરો",
-
-  "ws.hintShop": `દુકાનની વાત લખો, જેમ કે "5 શર્ટ 2500 માં વેચ્યા" અથવા "રાજે 2000 નો માલ ઉધાર લીધો".`,
-  "ws.hintHome": `ઘરનો ખર્ચ લખો, જેમ કે "500 નું કરિયાણું લીધું" અથવા "65000 પગાર આવ્યો".`,
-
-  "help.home": `👋 તમે {workspace} માં છો.
-
-બસ લખો શું ખર્ચ થયો, રોજિંદી ભાષામાં.
-
-"500 નું કરિયાણું લીધું"
-"લાઈટબિલ 2400 ભર્યું"
-"65000 પગાર આવ્યો"
-
-કમાન્ડ:
-
-/summary - આજનો હિસાબ
-/transactions - આજની એન્ટ્રી
-/monthly - આ મહિનાનો
-/workspace - દુકાન કે ઘર બદલો
-/language - ભાષા બદલો / भाषा / ભાષા
-/help - આ જ બતાવો`,
-
-  "help.shop": `👋 તમે {workspace} માં છો.
-
-બસ લખો શું થયું, રોજિંદી ભાષામાં.
-
-ખરીદ-વેચાણ:
-
-"600 ના 10 કિલો ચોખા લીધા"
-"5 શર્ટ 2500 માં વેચ્યા"
-"લાઈટબિલ 1800 ભર્યું"
-
-ઉધાર:
-
-"રાજે 2000 નો માલ ઉધાર લીધો"
-"રાજે 1000 આપ્યા"
-
-કંઈ પણ પૂછો:
-
-"રાજનું કેટલું બાકી છે?"
-"રાજની એન્ટ્રી બતાવો"
-
-કમાન્ડ:
-
-/summary - આજનો હિસાબ
-/transactions - આજની એન્ટ્રી
-/monthly - આ મહિનાનો
-/udhaar - કોનું ઉધાર બાકી છે
-/workspace - દુકાન કે ઘર બદલો
-/language - ભાષા બદલો / भाषा / ભાષા
-/help - આ જ બતાવો`,
-
   "toast.notFound": "એ એન્ટ્રી મળી નહીં.",
   "toast.alreadyDone": "આ પહેલેથી થઈ ગયું છે.",
   "toast.dataMissing": "એ એન્ટ્રીની વિગત મળી નહીં.",
@@ -267,8 +199,53 @@ export default {
   "error.rateLimit":
     "એકસાથે બહુ થઈ ગયું — એક મિનિટ થોભો, પછી લખતા રહો.",
 
-  "error.customerQueryAtHome":
-    "આ ગ્રાહકની વાત છે, અને {workspace} માં કોઈ ગ્રાહક હોતો નથી. /workspace થી દુકાન પર આવો.",
-  "error.typeNotInWorkspace":
-    "આ {workspace} માં લખી શક્યો નહીં. થોડું જુદી રીતે લખો, અથવા /workspace થી ચોપડો બદલો.",
+  // --------------------------------------------------
+  // મેનુ
+  // --------------------------------------------------
+
+  "help.menu":
+    "📒 તમે {workspace} માં છો\n\nજે થયું એ કહી દો, હું લખી લઈશ.\n\"1200 ના 3 શર્ટ વેચ્યા\"\n\"રાજુએ 500 નો સામાન ઉધાર લીધો\"\n\nકમાન્ડ: /menu /summary /monthly /transactions /udhaar /workspace /language",
+
+  "menu.thisLedger": "📊 આ મહિનો — {workspace}",
+  "menu.allLedgers": "🌍 આ મહિનો — બધા ચોપડા",
+  "menu.switch": "🔀 ચોપડો બદલો",
+  "menu.newLedger": "➕ નવો ચોપડો",
+  "menu.allTitle": "🌍 બધા ચોપડા",
+  "menu.everything": "કુલ:",
+  "menu.allEmpty": "આ મહિને હજી કોઈ ચોપડામાં કંઈ લખાયું નથી.",
+
+  // --------------------------------------------------
+  // નવો ચોપડો
+  // --------------------------------------------------
+
+  "ledger.prompt":
+    "➕ નવો ચોપડો\n\nઈમોજી અને નામ સાથે મોકલો:\n\n🏍️ બાઇક\n🌾 ખેતર\n🏪 બીજી દુકાન\n\nફક્ત નામ પણ ચાલશે — તો હું 📒 મૂકી દઈશ.",
+  "ledger.created": "✅ {workspace} તૈયાર છે, અને હવે તમે એમાં જ છો.",
+  "ledger.needName": "આ તો ફક્ત ઈમોજી છે — સાથે નામ પણ મોકલો, જેમ કે 🏍️ બાઇક.",
+  "ledger.duplicate":
+    "{ledger} પહેલેથી છે. બીજું નામ રાખો, અથવા /menu માંથી એમાં જ જાઓ.",
+  "ledger.tooMany":
+    "તમારી પાસે {max} ચોપડા છે, એથી વધારે હું સંભાળી નહીં શકું. જૂનામાંથી જ કોઈ વાપરો.",
+
+  // --------------------------------------------------
+  // પૈસા કઈ બાજુ
+  // --------------------------------------------------
+
+  "card.moneyIn": "પૈસા આવ્યા",
+  "card.moneyOut": "પૈસા ગયા",
+
+  "summary.moneyIn": "આવ્યા:",
+  "summary.moneyOut": "ગયા:",
+  "summary.net": "બચ્યા:",
+  "summary.onUdhaar": "ઉધાર પર:",
+
+  "khata.youOwe": "📒 તમારે {person} ને {amount} આપવાના છે.",
+
+  // --------------------------------------------------
+  // શરૂઆત
+  // --------------------------------------------------
+
+  "setup.ownButton": "✏️ મારું પોતાનું",
+  "ws.hint": "હવે તમે જે લખશો એ આ ચોપડામાં જ જશે.",
+  "practice.example": "600 ના 10 કિલો ચોખા ખરીદ્યા",
 };

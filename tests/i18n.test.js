@@ -11,6 +11,22 @@
 // No database and no API key needed — pure data.
 
 import assert from "node:assert/strict";
+
+// The transaction types that existed before migration 006. The AI does not
+// produce these any more — it writes its own label in the user's language —
+// but rows recorded before 006 still carry them, and enumLabel() renders those
+// through type.*. Delete this list when those rows are gone, not before.
+const LEGACY_TYPES = [
+  "sale",
+  "purchase",
+  "expense",
+  "payment_received",
+  "payment_sent",
+  "credit_sale",
+  "repayment",
+  "income",
+  "other",
+];
 import { readFileSync, readdirSync } from "node:fs";
 
 import {
@@ -27,8 +43,7 @@ import en from "../src/i18n/en.js";
 import hi from "../src/i18n/hi.js";
 import gu from "../src/i18n/gu.js";
 import {
-  TRANSACTION_TYPES,
-  HOUSEHOLD_CATEGORIES,
+  COMMON_CATEGORIES,
 } from "../src/schemas/transaction.schema.js";
 
 let passed = 0;
@@ -210,13 +225,13 @@ console.log("\ni18n: enum labels\n");
 // Gujarati card in the first place.
 for (const [code, catalog] of Object.entries(CATALOGS)) {
   check(`${code}: every transaction type has a label`, () => {
-    const missing = TRANSACTION_TYPES.filter((type) => !(`type.${type}` in catalog));
+    const missing = LEGACY_TYPES.filter((type) => !(`type.${type}` in catalog));
 
     assert.deepEqual(missing, [], `no label for: ${missing.join(", ")}`);
   });
 
   check(`${code}: every household category has a label`, () => {
-    const missing = HOUSEHOLD_CATEGORIES.filter((c) => !(`cat.${c}` in catalog));
+    const missing = COMMON_CATEGORIES.filter((c) => !(`cat.${c}` in catalog));
 
     assert.deepEqual(missing, [], `no label for: ${missing.join(", ")}`);
   });

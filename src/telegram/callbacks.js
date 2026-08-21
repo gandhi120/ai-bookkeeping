@@ -23,8 +23,15 @@ import {
   resolveShopkeeper,
   isOnboarding,
   money,
+  startSetup,
   needsPaymentClarification,
 } from "./core.js";
+import { getWorkspaces } from "../database/workspaces.js";
+import {
+  sendMonthlySummary,
+  sendAllLedgersSummary,
+  sendWorkspaceSwitcher,
+} from "./commands.js";
 import {
   transactionCard,
   transactionListCard,
@@ -36,16 +43,87 @@ import {
   handleOnboardingAction,
   ONBOARDING_STEPS,
   sendFeatureTour,
+  askForLedgerName,
 } from "./onboarding.js";
 
 
-// Maps a clarification button to the transaction type it means.
-// Callback data arrives from the user's Telegram client, so this lookup is
-// the whitelist: anything not listed here can never reach the database.
-const CLARIFIED_TYPE = {
-  repayment: "repayment",
-  income: "payment_received",
+// Maps a clarification button to what it means in the two axes.
+//
+// Both answers are money IN — the question is only ever asked about money
+// arriving from a named person. What the user is settling is whether it pays
+// down a debt or is simply theirs.
+//
+// Callback data arrives from the user's Telegram client, so this lookup is the
+// whitelist: anything not listed here can never reach the database.
+// `label` rides in the same entry as the values it describes, so a button can
+// never be captioned one thing and record another — the same reason TOUR in
+// onboarding.js pairs each label with its handler.
+const CLARIFIED_UDHAAR = {
+  repayment: {
+    cash: "in",
+    udhaar: "they_owe_less",
+    label: "clarify.repayment",
+  },
+  income: {
+    cash: "in",
+    udhaar: "none",
+    label: "clarify.normal",
+  },
 };
+
+
+// The four buttons on /menu. Callback data is user-supplied, so this list is
+// the whitelist — `menu:` with anything else never reaches a handler.
+const MENU_SCREENS = ["month", "all", "switch", "new"];
+
+
+// Runs one menu button. Each opens the REAL screen against the user's own
+// data — there is no menu-only rendering to drift from the commands.
+async function handleMenuAction(query, screen) {
+  const chatId = query.message.chat.id;
+
+  const { user, workspace } = await resolveShopkeeper(
+    query.from,
+    query.message.chat
+  );
+
+  // Every other handler gates on this, and a menu button can outlive the
+  // ledger it was drawn for — somebody taps a week-old message after their
+  // data was cleared.
+  if (!user.language || !workspace) {
+    await bot.answerCallbackQuery(query.id);
+    await startSetup(chatId, user, workspace);
+
+    return;
+  }
+
+  await bot.answerCallbackQuery(query.id);
+
+  if (screen === "month") {
+    await sendMonthlySummary(chatId, user, workspace);
+
+    return;
+  }
+
+  if (screen === "all") {
+    await sendAllLedgersSummary(chatId, user);
+
+    return;
+  }
+
+  if (screen === "switch") {
+    await sendWorkspaceSwitcher(
+      chatId,
+      user,
+      workspace,
+      await getWorkspaces(user.id)
+    );
+
+    return;
+  }
+
+  await askForLedgerName(chatId, user);
+}
 
 
 // --------------------------------------------------
@@ -87,6 +165,15 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
+    // Menu buttons carry a screen name, not a Telegram message id, so they
+    // are routed here for the same reason as the three above — and
+    // whitelisted, so a forged `menu:anything` is not routed at all.
+    if (action === "menu" && MENU_SCREENS.includes(messageId)) {
+      await handleMenuAction(query, messageId);
+
+      return;
+    }
+
     // Onboarding buttons carry a step name for the same reason, and are
     // whitelisted here so a forged payload can only ever be one of four.
     if (action === "onb" && ONBOARDING_STEPS.includes(messageId)) {
@@ -99,7 +186,14 @@ bot.on("callback_query", async (query) => {
 
     // Set only when the shopkeeper answered the "what was this money for?"
     // question. null for a plain Confirm, which keeps the AI's own type.
-    const typeOverride = CLARIFIED_TYPE[action] ?? null;
+    // Only the two fields, never `label` — this object is spread onto the
+    // entry that gets inserted.
+    const clarification = CLARIFIED_UDHAAR[action]
+      ? {
+          cash: CLARIFIED_UDHAAR[action].cash,
+          udhaar: CLARIFIED_UDHAAR[action].udhaar,
+        }
+      : null;
 
     // Get the shopkeeper who clicked the button. `workspace` is needed only
     // by the onboarding tour below, which picks its buttons from the ledger
@@ -170,7 +264,7 @@ bot.on("callback_query", async (query) => {
     //
     // A single-entry message keeps its original behaviour, where the same tap
     // both answers and saves. Two paths, but the common one is untouched.
-    if (entryIndex !== undefined && CLARIFIED_TYPE[action]) {
+    if (entryIndex !== undefined && CLARIFIED_UDHAAR[action]) {
       const index = Number(entryIndex);
 
       if (!transactions[index]) {
@@ -179,7 +273,9 @@ bot.on("callback_query", async (query) => {
         return;
       }
 
-      transactions[index].transaction_type = CLARIFIED_TYPE[action];
+      const { cash, udhaar } = CLARIFIED_UDHAAR[action];
+
+      Object.assign(transactions[index], { cash, udhaar });
 
       await updateMessageTransactionData(savedMessage.id, transactions);
 
@@ -188,7 +284,7 @@ bot.on("callback_query", async (query) => {
       // Replace the question so it cannot be answered twice.
       await bot.editMessageText(
         `${tr("clarify.question", { person: transactions[index].person })}
-${enumLabel(language, "type", CLARIFIED_TYPE[action])} ✅`,
+${tr(CLARIFIED_UDHAAR[action].label)} ✅`,
         {
           chat_id: query.message.chat.id,
           message_id: query.message.message_id,
@@ -239,13 +335,13 @@ ${enumLabel(language, "type", CLARIFIED_TYPE[action])} ✅`,
     // the meaning in the same tap)
     // --------------------------------------------------
 
-    if (action === "confirm" || typeOverride) {
+    if (action === "confirm" || clarification) {
       // Confirm the message and create the transaction
       // atomically inside PostgreSQL.
       const result = await confirmMessageTransaction(
         savedMessage.id,
         user.id,
-        typeOverride
+        clarification
       );
 
       // The message was not found.

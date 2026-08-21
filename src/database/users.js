@@ -61,3 +61,31 @@ export async function setUserLanguage(userId, language) {
 
   return result.rows[0];
 }
+
+// Records that the bot has asked this user a question and is waiting for the
+// answer in their NEXT message — currently only "new_ledger".
+//
+// NULL means "not waiting for anything", which is every user almost always.
+//
+// A column rather than an in-memory Map for the same reason the confirmation
+// flow is database-backed: the bot restarts on every deploy, and a Map would
+// strand whoever was mid-question with a bot that had forgotten it asked.
+//
+// Not whitelisted here the way setUserLanguage whitelists languages: nothing a
+// user can send reaches this, only the bot's own callback handlers, and the
+// value is compared against a literal at the one place it is read.
+export async function setPendingAction(userId, action) {
+  const result = await pool.query(
+    `
+    UPDATE users
+    SET
+      pending_action = $2,
+      updated_at = NOW()
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [userId, action]
+  );
+
+  return result.rows[0];
+}

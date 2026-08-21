@@ -207,7 +207,7 @@ try {
 
   // finishOnboarding sets onboarding_done_at in the same transaction that
   // deletes practice rows. Same exposure.
-  const workspaceA = await createWorkspace(userA.id, "Lang Shop", "shopkeeper");
+  const workspaceA = await createWorkspace(userA.id, "🏪", "Lang Shop");
 
   await setActiveWorkspace(userA.id, workspaceA.id);
 

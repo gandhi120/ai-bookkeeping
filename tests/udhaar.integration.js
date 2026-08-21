@@ -37,8 +37,9 @@ function check(name, actual, expected) {
 }
 
 // Pushes one transaction all the way through the real confirmation flow.
-// typeOverride simulates the shopkeeper tapping a clarification button.
-async function submitAndConfirm(user, msgId, transaction, typeOverride = null) {
+// clarification simulates the user tapping a clarification button: it carries
+// the two direction fields their answer means, not a type name.
+async function submitAndConfirm(user, msgId, transaction, clarification = null) {
   let saved = await createMessage({
     user_id: user.id,
     workspace_id: SHOP[user.id].id,
@@ -49,12 +50,16 @@ async function submitAndConfirm(user, msgId, transaction, typeOverride = null) {
   await updateMessageStatus(saved.id, "PROCESSING");
   await updateMessageTransactionData(saved.id, { ...transaction, telegram_message_id: msgId });
   await updateMessageStatus(saved.id, "PENDING_CONFIRMATION");
-  return { saved, result: await confirmMessageTransaction(saved.id, user.id, typeOverride) };
+  return { saved, result: await confirmMessageTransaction(saved.id, user.id, clarification) };
 }
 
-function txn(type, person, amount, description) {
+// (cash, udhaar) instead of a type name. `transaction_type` survives only as
+// the label the AI writes; nothing branches on it.
+function txn(cash, udhaar, person, amount, description) {
   return {
-    transaction_type: type,
+    transaction_type: description,
+    cash,
+    udhaar,
     description,
     category: "udhaar",
     quantity: 1,
@@ -74,33 +79,33 @@ const userB = await findOrCreateUser({ telegram_user_id: B_TG, telegram_chat_id:
 const SHOP = {};
 
 for (const u of [userA, userB]) {
-  SHOP[u.id] = await createWorkspace(u.id, "My Shop", "shopkeeper");
+  SHOP[u.id] = await createWorkspace(u.id, "🏪", "My Shop");
   await setActiveWorkspace(u.id, SHOP[u.id].id);
 }
 
 try {
   console.log("\n--- Test 4: credit sale creates customer + balance ---");
-  await submitAndConfirm(userA, 5001, txn("credit_sale", "Raj", 2000, "goods on udhaar"));
+  await submitAndConfirm(userA, 5001, txn("none", "they_owe_more", "Raj", 2000, "goods on udhaar"));
   let rajA = await getCustomerByName(userA.id, "Raj");
   check("customer Raj created for shop A", !!rajA, true);
   check("Raj owes 2000", await getCustomerBalance(userA.id, rajA.id), 2000);
 
   console.log("\n--- Test 5: partial repayment ---");
-  await submitAndConfirm(userA, 5002, txn("repayment", "Raj", 1000, "part payment"));
+  await submitAndConfirm(userA, 5002, txn("in", "they_owe_less", "Raj", 1000, "part payment"));
   check("Raj owes 1000 after paying 1000", await getCustomerBalance(userA.id, rajA.id), 1000);
 
   console.log("\n--- Test 6: full repayment ---");
-  await submitAndConfirm(userA, 5003, txn("repayment", "Raj", 1000, "cleared"));
+  await submitAndConfirm(userA, 5003, txn("in", "they_owe_less", "Raj", 1000, "cleared"));
   check("Raj owes 0 after clearing", await getCustomerBalance(userA.id, rajA.id), 0);
 
   console.log("\n--- Case-insensitive name resolves to same khata ---");
-  await submitAndConfirm(userA, 5004, txn("credit_sale", "RAJ", 500, "uppercase name"));
+  await submitAndConfirm(userA, 5004, txn("none", "they_owe_more", "RAJ", 500, "uppercase name"));
   const customersA = (await pool.query("SELECT * FROM customers WHERE user_id=$1", [userA.id])).rows;
   check("still only ONE Raj row for shop A", customersA.length, 1);
   check("Raj owes 500 (uppercase merged)", await getCustomerBalance(userA.id, rajA.id), 500);
 
   console.log("\n--- Test 9: SAME NAME, DIFFERENT SHOPKEEPER (isolation) ---");
-  await submitAndConfirm(userB, 5001, txn("credit_sale", "Raj", 500, "B's Raj"));
+  await submitAndConfirm(userB, 5001, txn("none", "they_owe_more", "Raj", 500, "B's Raj"));
   const rajB = await getCustomerByName(userB.id, "Raj");
   check("shop B has its own Raj row", rajB.id !== rajA.id, true);
   check("B's Raj owes 500", await getCustomerBalance(userB.id, rajB.id), 500);
@@ -115,7 +120,7 @@ try {
   check("both shopkeepers stored message id 5001", bothRows.length, 2);
 
   console.log("\n--- Test 10: double confirm ---");
-  const { saved, result: first } = await submitAndConfirm(userA, 5005, txn("credit_sale", "Amit", 300, "double tap"));
+  const { saved, result: first } = await submitAndConfirm(userA, 5005, txn("none", "they_owe_more", "Amit", 300, "double tap"));
   const second = await confirmMessageTransaction(saved.id, userA.id);
   check("first confirm succeeds", first.success, true);
   check("second confirm refused", second.reason, "ALREADY_PROCESSED");
@@ -126,7 +131,7 @@ try {
 
   console.log("\n--- Test 11: cancel creates nothing ---");
   const cancelMsg = await createMessage({ user_id: userA.id, workspace_id: SHOP[userA.id].id, telegram_message_id: 5006, message_text: "cancel me", status: "RECEIVED" });
-  await updateMessageTransactionData(cancelMsg.id, { ...txn("credit_sale", "Vijay", 900, "cancelled"), telegram_message_id: 5006 });
+  await updateMessageTransactionData(cancelMsg.id, { ...txn("none", "they_owe_more", "Vijay", 900, "cancelled"), telegram_message_id: 5006 });
   await updateMessageStatus(cancelMsg.id, "PENDING_CONFIRMATION");
   await updateMessageStatus(cancelMsg.id, "CANCELLED");
   const cancelled = await confirmMessageTransaction(cancelMsg.id, userA.id);
@@ -155,7 +160,7 @@ try {
   check("no row of B leaks into A", aToday.every(r => r.user_id === userA.id), true);
 
   console.log("\n--- Non-customer transaction has no customer_id ---");
-  await submitAndConfirm(userA, 5008, { ...txn("payment_sent", null, 3000, "paid supplier"), person: null });
+  await submitAndConfirm(userA, 5008, { ...txn("out", "none", null, 3000, "paid supplier"), person: null });
   const supplier = (await pool.query(
     "SELECT customer_id FROM transactions WHERE user_id=$1 AND telegram_message_id='5008'", [userA.id]
   )).rows[0];
@@ -168,31 +173,36 @@ try {
   console.log("\n--- Ambiguous payment clarified as UDHAAR REPAYMENT ---");
   const before = await getCustomerBalance(userA.id, rajA.id);
   await submitAndConfirm(
-    userA, 5009, txn("payment_received", "Raj", 200, "received from Raj"), "repayment"
+    userA, 5009, txn("in", "none", "Raj", 200, "received from Raj"),
+    { cash: "in", udhaar: "they_owe_less" }
   );
   const repaid = (await pool.query(
-    "SELECT transaction_type, customer_id FROM transactions WHERE user_id=$1 AND telegram_message_id='5009'", [userA.id]
+    "SELECT udhaar, customer_id, owed_delta FROM transactions WHERE user_id=$1 AND telegram_message_id='5009'", [userA.id]
   )).rows[0];
-  check("stored as repayment, not the AI's payment_received", repaid.transaction_type, "repayment");
+  check("stored as a debt going down, not the AI's plain money-in", repaid.udhaar, "they_owe_less");
+  check("and the generated column signed it negative", Number(repaid.owed_delta), -200);
   check("linked to Raj's khata", repaid.customer_id, rajA.id);
   check("balance dropped by 200", await getCustomerBalance(userA.id, rajA.id), before - 200);
 
   console.log("\n--- Ambiguous payment clarified as NORMAL PAYMENT ---");
   const beforeIncome = await getCustomerBalance(userA.id, rajA.id);
   await submitAndConfirm(
-    userA, 5010, txn("payment_received", "Raj", 700, "received from Raj"), "payment_received"
+    userA, 5010, txn("in", "none", "Raj", 700, "received from Raj"),
+    { cash: "in", udhaar: "none" }
   );
   const income = (await pool.query(
-    "SELECT transaction_type, customer_id, person FROM transactions WHERE user_id=$1 AND telegram_message_id='5010'", [userA.id]
+    "SELECT cash, udhaar, customer_id, person FROM transactions WHERE user_id=$1 AND telegram_message_id='5010'", [userA.id]
   )).rows[0];
-  check("stored as payment_received", income.transaction_type, "payment_received");
+  check("stored as plain money in", income.cash, "in");
+  check("with nobody's debt moved", income.udhaar, "none");
   check("NOT linked to a khata", income.customer_id, null);
   check("person is still recorded", income.person, "Raj");
   check("balance unmoved", await getCustomerBalance(userA.id, rajA.id), beforeIncome);
 
   console.log("\n--- Double tap on a clarification button ---");
   const { saved: clarifySaved, result: firstTap } = await submitAndConfirm(
-    userA, 5011, txn("payment_received", "Raj", 100, "double tapped"), "repayment"
+    userA, 5011, txn("in", "none", "Raj", 100, "double tapped"),
+    { cash: "in", udhaar: "they_owe_less" }
   );
   const secondTap = await confirmMessageTransaction(clarifySaved.id, userA.id, "payment_received");
   check("first tap succeeds", firstTap.success, true);
@@ -226,9 +236,9 @@ try {
   await updateMessageTransactionData(
     batchSaved.id,
     [
-      { ...txn("purchase", null, 400, "dudh"), telegram_message_id: batchMsgId, seq: 0 },
-      { ...txn("purchase", null, 300, "sabu"), telegram_message_id: batchMsgId, seq: 1 },
-      { ...txn("credit_sale", "BatchRaj", 600, "chokha"), telegram_message_id: batchMsgId, seq: 2 },
+      { ...txn("out", "none", null, 400, "dudh"), telegram_message_id: batchMsgId, seq: 0 },
+      { ...txn("out", "none", null, 300, "sabu"), telegram_message_id: batchMsgId, seq: 1 },
+      { ...txn("none", "they_owe_more", "BatchRaj", 600, "chokha"), telegram_message_id: batchMsgId, seq: 2 },
     ]
   );
   await updateMessageStatus(batchSaved.id, "PENDING_CONFIRMATION");
@@ -281,13 +291,13 @@ try {
   await updateMessageTransactionData(
     badSaved.id,
     [
-      { ...txn("purchase", null, 100, "fine"), telegram_message_id: badMsgId, seq: 0 },
+      { ...txn("out", "none", null, 100, "fine"), telegram_message_id: badMsgId, seq: 0 },
       // Every column in `transactions` is nullable, so a null cannot be used
       // to force a failure. A string that will not cast can: the insert binds
       // this as $9::date and Postgres rejects it outright. That is a genuine
       // database-level failure partway through the batch, which is what the
       // all-or-nothing promise has to survive.
-      { ...txn("purchase", null, 200, "broken"), transaction_date: "not-a-date", telegram_message_id: badMsgId, seq: 1 },
+      { ...txn("out", "none", null, 200, "broken"), transaction_date: "not-a-date", telegram_message_id: badMsgId, seq: 1 },
     ]
   );
   await updateMessageStatus(badSaved.id, "PENDING_CONFIRMATION");

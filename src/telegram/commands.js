@@ -5,7 +5,10 @@
 // REAL command against the user's own data rather than a mock-up of it.
 
 import { getDailySummary } from "../services/summary.service.js";
-import { getMonthlySummary } from "../services/monthly-summary.service.js";
+import {
+  getMonthlySummary,
+  getMonthlySummaryAll,
+} from "../services/monthly-summary.service.js";
 import { getWorkspaces } from "../database/workspaces.js";
 import { getTransactionsByDate } from "../database/transactions.js";
 import { getAllOutstanding } from "../database/customers.js";
@@ -21,7 +24,6 @@ import {
 import {
   bot,
   resolveShopkeeper,
-  WORKSPACE_KINDS,
   workspaceLabel,
   startSetup,
   askToChooseLanguage,
@@ -59,13 +61,7 @@ async function sendMonthlySummary(chatId, user, workspace) {
     })
   );
 
-  const summary = await getMonthlySummary(
-    user.id,
-    workspace.id,
-    year,
-    month,
-    workspace.type
-  );
+  const summary = await getMonthlySummary(user.id, workspace.id, year, month);
 
   const tr = translator(user);
 
@@ -75,7 +71,7 @@ async function sendMonthlySummary(chatId, user, workspace) {
 
 ${formatMonth(user.language, now)}
 
-${summaryBody(user, workspace, summary, { categories: true })}
+${summaryBody(user, summary, { categories: true })}
 
 ${tr("summary.count")} ${summary.transactionCount}`
   );
@@ -116,22 +112,135 @@ bot.onText(/^\/monthly$/, async (message) => {
 // /start
 // --------------------------------------------------
 
-// The "here is how to use me" screen, sent by /start, by /help, and again at
-// the end of onboarding.
+// THE MENU. Sent by /menu, by /start, by /help, and again at the end of
+// onboarding — one screen with four buttons rather than four screens.
 //
-// It branches on the ledger: a household is never shown /udhaar, because a
-// household has no customers. /help used to be a second, near-identical copy
-// of this that showed the shop commands to everybody and patched it with a
-// footnote — it now calls this instead, which is both shorter and correct.
+// It used to branch on the ledger so a household was never shown /udhaar.
+// There is nothing left to branch on: every ledger does everything.
+//
+// The active ledger's NAME is inside the button label, not in a line of text
+// above it. Somebody reading four buttons in Gujarati should be able to tap
+// the right one without reading the message.
+//
+// Slash commands still work and are listed in the text — the buttons are for
+// the majority who never learn them.
 async function sendWelcomeHelp(chatId, user, workspace) {
   const tr = translator(user);
 
   await bot.sendMessage(
     chatId,
-    tr(workspace.type === "household" ? "help.home" : "help.shop", {
-      workspace: workspaceLabel(workspace),
-    })
+    tr("help.menu", { workspace: workspaceLabel(workspace) }),
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: tr("menu.thisLedger", {
+                workspace: workspaceLabel(workspace),
+              }),
+              callback_data: "menu:month",
+            },
+          ],
+          [{ text: tr("menu.allLedgers"), callback_data: "menu:all" }],
+          [{ text: tr("menu.switch"), callback_data: "menu:switch" }],
+          [{ text: tr("menu.newLedger"), callback_data: "menu:new" }],
+          [
+            {
+              text: tr("language.button", {
+                label: LANGUAGES[user.language].label,
+              }),
+              callback_data: "lang:pick",
+            },
+          ],
+        ],
+      },
+    }
   );
+}
+
+
+// This month, across every ledger the user keeps.
+//
+// The one report that deliberately crosses ledgers. A ledger with nothing in
+// it this month is left out entirely rather than shown at zero — the point of
+// this screen is the comparison, and empty rows are what make a comparison
+// hard to read.
+async function sendAllLedgersSummary(chatId, user) {
+  const tr = translator(user);
+  const now = new Date();
+
+  const year = Number(
+    now.toLocaleDateString("en-IN", { year: "numeric", timeZone: "Asia/Kolkata" })
+  );
+
+  const month = Number(
+    now.toLocaleDateString("en-IN", { month: "numeric", timeZone: "Asia/Kolkata" })
+  );
+
+  const summary = await getMonthlySummaryAll(user.id, year, month);
+
+  if (summary.ledgers.length === 0) {
+    await bot.sendMessage(chatId, tr("menu.allEmpty"));
+
+    return;
+  }
+
+  const blocks = summary.ledgers.map(
+    (ledger) => `${ledger.emoji} ${ledger.name}
+${tr("summary.moneyIn")} ${money(ledger.moneyIn)} · ${tr(
+      "summary.moneyOut"
+    )} ${money(ledger.moneyOut)}
+${tr("summary.net")} ${money(ledger.net)}`
+  );
+
+  const footer = [`${tr("menu.everything")} ${money(summary.total.net)}`];
+
+  if (summary.total.onUdhaar > 0) {
+    footer.push(`${tr("summary.onUdhaar")} ${money(summary.total.onUdhaar)}`);
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `${tr("menu.allTitle")}
+
+${formatMonth(user.language, now)}
+
+${blocks.join("\n\n")}
+───────────────
+${footer.join("\n")}`
+  );
+}
+
+
+// The ledger switcher: one row per ledger, ✓ on the active one, and a way to
+// make another. Shared by /workspace and the menu's Switch button.
+async function sendWorkspaceSwitcher(chatId, user, workspace, workspaces) {
+  const tr = translator(user);
+
+  const rows = workspaces.map((existing) => [
+    {
+      text: `${workspaceLabel(existing)}${
+        existing.id === workspace?.id ? "  ✓" : ""
+      }`,
+      callback_data: `ws:${existing.id}`,
+    },
+  ]);
+
+  rows.push([{ text: tr("menu.newLedger"), callback_data: "menu:new" }]);
+
+  // And the language row. This screen is the closest thing the bot has to
+  // settings, so it is where somebody looks for the language — /language
+  // works too, but nobody discovers a command they were never shown.
+  rows.push([
+    {
+      text: tr("language.button", { label: LANGUAGES[user.language].label }),
+      callback_data: "lang:pick",
+    },
+  ]);
+
+  await bot.sendMessage(chatId, tr("ws.current"), {
+    reply_markup: { inline_keyboard: rows },
+  });
 }
 
 
@@ -156,6 +265,27 @@ bot.onText(/^\/start$/, async (message) => {
 
   if (isOnboarding(user)) {
     await sendPracticePrompt(message.chat.id, user, workspace);
+
+    return;
+  }
+
+  await sendWelcomeHelp(message.chat.id, user, workspace);
+});
+
+
+// --------------------------------------------------
+// /menu
+// --------------------------------------------------
+
+// The same screen /start sends, under the name people look for.
+bot.onText(/^\/menu$/, async (message) => {
+  const { user, workspace } = await resolveShopkeeper(
+    message.from,
+    message.chat
+  );
+
+  if (!user.language || !workspace) {
+    await startSetup(message.chat.id, user, workspace);
 
     return;
   }
@@ -190,45 +320,7 @@ bot.onText(/^\/workspace$/, async (message) => {
       return;
     }
 
-    // One row per existing workspace, ✓ on the active one.
-    const rows = workspaces.map((existing) => [
-      {
-        text: `${workspaceLabel(existing)}${
-          existing.id === workspace?.id ? "  ✓" : ""
-        }`,
-        callback_data: `ws:${existing.id}`,
-      },
-    ]);
-
-    const tr = translator(user);
-
-    // Then an "+ Add ..." button for whichever kind they don't have yet.
-    for (const [type, kind] of Object.entries(WORKSPACE_KINDS)) {
-      if (!workspaces.some((existing) => existing.type === type)) {
-        rows.push([
-          {
-            text: tr("ws.add", { label: tr(kind.labelKey) }),
-            callback_data: `addws:${type}`,
-          },
-        ]);
-      }
-    }
-
-    // And the language row. This screen is the closest thing the bot has to
-    // settings, so it is where somebody looks for the language — /language
-    // works too, but nobody discovers a command they were never shown.
-    rows.push([
-      {
-        text: tr("language.button", {
-          label: LANGUAGES[user.language].label,
-        }),
-        callback_data: "lang:pick",
-      },
-    ]);
-
-    await bot.sendMessage(message.chat.id, tr("ws.current"), {
-      reply_markup: { inline_keyboard: rows },
-    });
+    await sendWorkspaceSwitcher(message.chat.id, user, workspace, workspaces);
   } catch (error) {
     console.error("Workspace error:", error);
 
@@ -395,12 +487,7 @@ bot.onText(/^\/transactions$/, async (message) => {
 // button shows the real thing rather than a mock-up of it — the point of that
 // step is to prove the entry they just made actually landed.
 async function sendDailySummary(chatId, user, workspace) {
-  const summary = await getDailySummary(
-    user.id,
-    workspace.id,
-    today(),
-    workspace.type
-  );
+  const summary = await getDailySummary(user.id, workspace.id, today());
 
   const tr = translator(user);
 
@@ -410,7 +497,7 @@ async function sendDailySummary(chatId, user, workspace) {
 
 ${tr("summary.date")} ${formatDate(user.language, summary.date)}
 
-${summaryBody(user, workspace, summary)}
+${summaryBody(user, summary)}
 
 ${tr("summary.count")} ${summary.transactionCount}`
   );
@@ -451,21 +538,19 @@ bot.onText(/^\/summary$/, async (message) => {
 // /udhaar
 // --------------------------------------------------
 
-// Builds and sends the khata — everyone who still owes this shopkeeper money.
+// Builds and sends the khata — everyone with an open balance, in either
+// direction.
 //
 // Split out of the /udhaar command so the onboarding tour can run the real
-// thing from a button. The shop-only check stays INSIDE this function rather
-// than in the command wrapper, so a forged `onb:udhaar` from a household user
-// is refused at the same place the command refuses it.
+// thing from a button.
+//
+// There used to be a shop-only check here, because a household had no
+// customers. It is gone: the khata belongs to the USER, not to one ledger, and
+// a household borrows from an uncle as readily as a shop lends to a regular.
+// The list is user-wide for the same reason — Raj owes you, he does not owe
+// your Kirana book.
 async function sendUdhaarList(chatId, user, workspace) {
   const tr = translator(user);
-
-  // Udhaar is a khata, and only a shop keeps one.
-  if (workspace.type !== "shopkeeper") {
-    await bot.sendMessage(chatId, tr("udhaar.wrongLedger"));
-
-    return;
-  }
 
   const customers = await getAllOutstanding(user.id);
 
@@ -536,6 +621,8 @@ bot.onText(/^\/udhaar$/, async (message) => {
 export {
   sendDailySummary,
   sendMonthlySummary,
+  sendAllLedgersSummary,
+  sendWorkspaceSwitcher,
   sendTransactionsList,
   sendUdhaarList,
   sendWelcomeHelp,

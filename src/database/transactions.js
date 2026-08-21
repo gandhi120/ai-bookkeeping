@@ -46,17 +46,50 @@ export async function getTransactionsByMonth(userId, workspaceId, year, month) {
   return result.rows;
 }
 
+// Every ledger's month in ONE round trip, tagged with which ledger each row
+// came from. Powers "this month, everywhere" on /menu.
+//
+// Scoped by user_id alone ON PURPOSE — this is the one view that is meant to
+// cross ledgers. The join to workspaces is what keeps it inside the user
+// regardless: a row can only appear if its workspace belongs to them.
+//
+// Ordered by w.created_at so ledgers come back in the same order the switcher
+// lists them. A summary whose sections move around between months is unreadable.
+//
+// No new index needed: transactions_user_date_idx is (user_id, transaction_date),
+// which is exactly this shape.
+export async function getTransactionsByMonthAllWorkspaces(userId, year, month) {
+  const result = await pool.query(
+    `
+    SELECT
+      t.*,
+      w.id    AS ws_id,
+      w.emoji AS ws_emoji,
+      w.name  AS ws_name
+    FROM transactions t
+    JOIN workspaces w ON w.id = t.workspace_id
+    WHERE t.user_id = $1
+      AND t.transaction_date >= make_date($2, $3, 1)
+      AND t.transaction_date <  make_date($2, $3, 1) + INTERVAL '1 month'
+    ORDER BY w.created_at, t.transaction_date DESC, t.created_at DESC;
+    `,
+    [userId, year, month]
+  );
+
+  return result.rows;
+}
+
 // Confirms a pending message and creates its transaction atomically.
 // Both database changes succeed together or both are rolled back.
 //
-// typeOverride is used when the AI could not tell what a payment meant and
-// the shopkeeper answered the clarification question. Passing their answer
-// in here (instead of updating transaction_data first and confirming after)
-// keeps it a single atomic step, so a double tap still produces one row.
+// `clarification` is used when the AI could not tell what a payment meant and
+// the user answered the question — `{ cash, udhaar }`. Passing their answer in
+// here (instead of updating transaction_data first and confirming after) keeps
+// it a single atomic step, so a double tap still produces one row.
 export async function confirmMessageTransaction(
   messageId,
   userId,
-  typeOverride = null
+  clarification = null
 ) {
   const client = await pool.connect();
 
@@ -129,33 +162,35 @@ export async function confirmMessageTransaction(
       };
     }
 
-    // For udhaar entries (credit_sale / repayment), the customer is resolved
-    // BEFORE inserting, on the same client, so the customer and the row are
-    // created together or not at all. Everything else keeps customer_id null.
+    // For udhaar entries — anything whose `udhaar` is not "none" — the customer
+    // is resolved BEFORE inserting, on the same client, so the customer and the
+    // row are created together or not at all. Everything else keeps
+    // customer_id null.
     //
     // Sequential rather than concurrent on purpose: they share one client, and
     // two entries naming the same new customer must not race to create it.
     const rows = [];
 
     for (const [index, entry] of entries.entries()) {
-      // The shopkeeper's clarification wins over what the AI stored. For a
+      // The user's clarification wins over what the AI stored. For a
       // single-entry message the override applies to it; for several, the bot
       // has already written each answer back into the stored data, so the
       // override is only ever used when there is exactly one entry.
-      const transactionType =
-        (entries.length === 1 ? typeOverride : null) ?? entry.transaction_type;
+      const answered =
+        (entries.length === 1 ? clarification : null) ?? {};
+
+      const resolved = { ...entry, ...answered };
 
       let customerId = null;
 
-      if (isCustomerTransaction(transactionType) && entry.person) {
+      if (isCustomerTransaction(resolved) && entry.person) {
         const customer = await findOrCreateCustomer(client, userId, entry.person);
 
         customerId = customer.id;
       }
 
       rows.push({
-        entry,
-        transactionType,
+        entry: resolved,
         customerId,
         // Position within the message. Stored so the widened unique
         // constraint can tell entry 2 from entry 1 while still refusing a
@@ -163,6 +198,26 @@ export async function confirmMessageTransaction(
         seq: entry.seq ?? index,
       });
     }
+
+    // The column order, declared once. `params` below pushes values in this
+    // exact order, and the INSERT names them in it — so the three cannot drift.
+    const INSERT_COLUMNS = [
+      "user_id",
+      "workspace_id",
+      "transaction_type",
+      "cash",
+      "udhaar",
+      "description",
+      "category",
+      "quantity",
+      "amount",
+      "person",
+      "transaction_date",
+      "notes",
+      "telegram_message_id",
+      "customer_id",
+      "seq",
+    ];
 
     // One statement, N rows, inside the transaction that is already open —
     // so a failure on entry 3 leaves entries 1 and 2 unwritten too. That is
@@ -173,22 +228,37 @@ export async function confirmMessageTransaction(
     // 2 no longer collides with entry 1. See migrations/005_multi_transaction.
     const values = rows
       .map((_, index) => {
-        const at = index * 13;
+        // `at` is where this row's placeholders start, so the numbering keeps
+        // running across rows: with 15 columns, entry 2 uses $16..$30.
+        const at = index * INSERT_COLUMNS.length;
 
-        return `($${at + 1}, $${at + 2}, $${at + 3}, $${at + 4}, $${at + 5}, $${
-          at + 6
-        }, $${at + 7}, $${at + 8}, $${at + 9}::date, $${at + 10}, $${at + 11}, $${
-          at + 12
-        }, $${at + 13})`;
+        const placeholders = INSERT_COLUMNS.map((column, offset) =>
+          // transaction_date is the only one needing a cast; everything else
+          // Postgres infers from the column it is inserted into. Found by NAME,
+          // not by a hardcoded position — adding `cash` and `udhaar` shifted
+          // this from the 9th column to the 11th, and a fixed index would have
+          // quietly cast the amount instead.
+          column === "transaction_date"
+            ? `$${at + offset + 1}::date`
+            : `$${at + offset + 1}`
+        );
+
+        return `(${placeholders.join(", ")})`;
       })
       .join(",\n        ");
 
-    const params = rows.flatMap(({ entry, transactionType, customerId, seq }) => [
+    const params = rows.flatMap(({ entry, customerId, seq }) => [
       userId,
       // Taken from the locked MESSAGE row, never from the user's current
       // active workspace — see the comment on createMessage.
       message.workspace_id,
-      transactionType,
+      entry.transaction_type,
+      // The two the totals are built from. Defaulted rather than assumed
+      // present: the column is NOT NULL DEFAULT 'none', and an entry that
+      // somehow arrives without them should land as "nothing moved" rather
+      // than throw mid-BEGIN.
+      entry.cash ?? "none",
+      entry.udhaar ?? "none",
       entry.description,
       entry.category,
       entry.quantity,
@@ -203,21 +273,7 @@ export async function confirmMessageTransaction(
 
     await client.query(
       `
-      INSERT INTO transactions (
-        user_id,
-        workspace_id,
-        transaction_type,
-        description,
-        category,
-        quantity,
-        amount,
-        person,
-        transaction_date,
-        notes,
-        telegram_message_id,
-        customer_id,
-        seq
-      )
+      INSERT INTO transactions (${INSERT_COLUMNS.join(", ")})
       VALUES
         ${values}
       ON CONFLICT (user_id, telegram_message_id, seq) DO NOTHING;
