@@ -21,7 +21,7 @@ npm run dev      # same, with --watch
 grew its own webhook server — nothing imports either.
 
 ```bash
-npm test         # schema + summary + ledger + ratelimit + i18n. No DB, no API key, free.
+npm test         # schema + summary + ledger + gym + sheet + ratelimit + i18n. No DB, no API key, free.
 npm run test:db  # tests/udhaar.integration.js — real Postgres. Needs DATABASE_URL.
 npm run test:ws  # tests/workspace.integration.js — workspace isolation. Needs DATABASE_URL.
 npm run test:onb # tests/onboarding.integration.js — onboarding + practice-data cleanup. Needs DATABASE_URL.
@@ -34,6 +34,10 @@ No linter is configured. Every integration suite creates throwaway users and del
 Required env vars (in `.env`, loaded via `dotenv/config`): `GROQ_API_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`.
 
 Optional: `GEMINI_API_KEY` enables the Gemini fallback (see below); `GEMINI_MODEL` overrides the default `gemini-3.1-flash-lite`, and `GROQ_MODEL` the default `openai/gpt-oss-120b`.
+
+Optional, gym only: `GYM_SHEET_URL` and `GYM_SHEET_SECRET` (see **The gym
+module**). Deliberately NOT in the boot check — a missing gym variable must
+never stop the bookkeeping bot from starting.
 
 ## Transport: polling vs webhook
 
@@ -388,3 +392,59 @@ kpda dhova no sabu lavya"*. Both prompts ask for a **JSON list always**, and
 - **Everything reads `transaction_data` as a list** via `[x].flat()`, so
   messages stored before this feature are still confirmable.
 - See **The money model** above: there are no transaction types, only `cash` and `udhaar`.
+
+## The gym module
+
+`src/gym/` is a **second, unrelated product** living in the same bot: a daily
+fitness check-in that writes one row into a coach's Google Sheet. It is not
+bookkeeping and shares no code with it.
+
+**It must stay that way.** The isolation is the design, not an accident:
+
+- `src/gym/` imports nothing from the rest of `src/` except `zod`. It has its
+  own model call (`ai.js`, duplicating the Gemini→Groq fallback on purpose),
+  its own three-language strings (`text.js`), its own schema and prompt.
+- Only `src/gym/telegram.js` reaches out, read-only, for `bot` and
+  `resolveShopkeeper`. It lives in `src/gym/` rather than `src/telegram/`
+  because `tests/i18n.test.js` scans that folder and asserts every `tr()` key
+  exists in the BOOKKEEPING catalog — a gym handler there fails a bookkeeping
+  test for using its own strings.
+- The entire footprint on the ledgers is **one import line in `bot.js`**.
+  Deleting the feature is deleting `src/gym/`, two test files, and that line.
+
+Do not refactor a shared helper to serve both. Duplicating a small amount of
+code is the cheaper trade: the money path holds a shop's accounts and the gym
+path is a personal log, and a shared helper means a change to one can break
+the other.
+
+- **No confirmation card**, unlike every bookkeeping write. A transaction is
+  confirmed first because money is hard to unwind. A check-in writes one
+  spreadsheet cell keyed by date, so sending the day again overwrites the same
+  row — the correction IS the flow. The reply prints back exactly what was
+  written, so a misread is caught immediately instead of by the coach a week
+  later.
+- **`src/gym/Checkin.gs` is a STANDALONE Apps Script**, created at
+  script.google.com and not from the sheet's Extensions menu — that menu is
+  greyed out on a file owned by someone else. Standalone runs as the user,
+  using their own edit rights, so nothing has to be shared with a service
+  account. That is also why there is no Google Cloud project: a service account
+  would need *share* rights on the coach's file, not just edit.
+- **Nothing about the sheet layout is hardcoded.** No A1 ranges, no column
+  letters, no row numbers. The tracker is a merged-cell grid — week blocks, an
+  AVERAGES row between them, dates written as "27 July" with no year — and it
+  all shifts when the coach inserts a row. The script reads the sheet's own
+  headers and matches by label: exact first, then containment, because
+  "Hydration" has to find "Hydration/Fluid Intake" and "discomfort" has to find
+  "Did you face any physical discomfort or pain?".
+- **A label that matches nothing is reported, never swallowed.** The script
+  answers `unmatched: <labels>` and the bot logs it. That is what a renamed
+  header looks like, and it is the failure the whole match-by-label approach
+  exists to make visible.
+- **`tests/sheet.test.js` loads `Checkin.gs` itself** with `node:vm` and calls
+  its functions against a reconstruction of the real grid. The helpers are pure
+  ES5 and touch no Apps Script API, so what is proven is the file that gets
+  pasted rather than a copy that drifts.
+- **After any edit to `Checkin.gs`: Deploy > Manage deployments > edit >
+  Version: New.** Otherwise the old code keeps answering and it looks like
+  nothing changed. `Run > test_findsTodaysRow` writes nothing and logs every
+  label it found plus today's row — run that first when something is wrong.

@@ -94,6 +94,16 @@ bot.on("message", async (message) => {
     return;
   }
 
+  // A reply to one of the bot's OWN messages is an answer to a question it
+  // asked, not free text to book. Without this, replying "82.5" to a prompt
+  // would be read here as a transaction as well as by whoever asked.
+  //
+  // Checked by sender rather than by content: this file must not know what
+  // any other feature's prompts look like.
+  if (message.reply_to_message?.from?.is_bot) {
+    return;
+  }
+
   // Ignore Telegram commands.
   if (message.text.startsWith("/")) {
     return;

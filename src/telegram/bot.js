@@ -21,6 +21,11 @@ import "./commands.js";
 import "./messages.js";
 import "./callbacks.js";
 
+// The gym check-in. A separate domain that shares no code with the ledgers —
+// see src/gym/. Registered last because it registers nothing the others need,
+// and it is the one import to delete if the feature goes.
+import "../gym/telegram.js";
+
 
 // True only when this file is the process entry point. Importing it — from a
 // test, or from server.js if HTTP is ever added back — then defines the
